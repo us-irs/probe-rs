@@ -12,7 +12,6 @@ use probe_rs_target::CoreType;
 
 use crate::{
     architecture::arm::{
-        armv7m::Vtor,
         core::registers::cortex_m::{PC, SP},
         dp::{DLPIDR, TARGETID},
         ArmProbeInterface,
@@ -26,7 +25,7 @@ use super::{
     armv6m::Demcr,
     communication_interface::{DapProbe, Initialized},
     component::{TraceFunnel, TraceSink},
-    core::cortex_m::Dhcsr,
+    core::cortex_m::{Dhcsr, Vtor},
     dp::{Abort, Ctrl, DebugPortError, DpAccess, Select, DPIDR},
     memory::{
         adi_v5_memory_interface::ArmProbe,
@@ -973,6 +972,7 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
         vector_table_offset: u64,
         session: &mut Session,
     ) -> Result<(), crate::Error> {
+        tracing::info!("Performing RAM flash start");
         const SP_MAIN_OFFSET: usize = 0;
         const RESET_VECTOR_OFFSET: usize = 1;
 
@@ -990,10 +990,10 @@ pub trait ArmDebugSequence: Send + Sync + Debug {
                 ));
             }
             CoreType::Armv6m | CoreType::Armv7m | CoreType::Armv7em | CoreType::Armv8m => {
-                tracing::info!("ram flash setup");
+                tracing::debug!("RAM flash start for Cortex-M single core target");
                 let mut core = session.core(0)?;
                 // Ensure the core is halted in any case.
-                core.halt(Duration::from_millis(500))?;
+                core.halt(Duration::from_millis(100))?;
                 // See ARMv7-M Architecture Reference Manual Chapter B1.5 for more details. The
                 // process appears to be the same for the other Cortex-M architectures as well.
                 let vtor = Vtor(vector_table_offset as u32);
