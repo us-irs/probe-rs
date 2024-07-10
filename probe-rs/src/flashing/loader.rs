@@ -561,7 +561,8 @@ impl FlashLoader {
             // problematic if the instruction RAM is flashed while an application is running, so
             // the core is halted here in any case.
             if !core.core_halted().map_err(FlashError::Core)? {
-                core.halt(Duration::from_secs(100)).map_err(FlashError::Core)?;
+                core.halt(Duration::from_secs(100))
+                    .map_err(FlashError::Core)?;
             }
 
             let mut some = false;

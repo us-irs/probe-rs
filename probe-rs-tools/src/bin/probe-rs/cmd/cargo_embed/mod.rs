@@ -226,8 +226,6 @@ fn main_try(args: &[OsString], offset: UtcOffset) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    let core_id = rtt::get_target_core_id(&mut session, &path);
-
     let ram_flash = if config.flashing.enabled {
         let download_options = BinaryDownloadOptions {
             disable_progressbars: opt.disable_progressbars,
@@ -238,7 +236,6 @@ fn main_try(args: &[OsString], offset: UtcOffset) -> Result<()> {
         };
         let format_options = FormatOptions::default();
         let loader = build_loader(&mut session, &path, format_options, image_instr_set)?;
-        session.core(core_id)?.halt(Duration::from_millis(100))?;
         let flash_info = run_flash_download(
             &mut session,
             &path,
@@ -248,12 +245,8 @@ fn main_try(args: &[OsString], offset: UtcOffset) -> Result<()> {
             config.flashing.do_chip_erase,
         )?;
 
-        tracing::info!("flash download done");
         if flash_info.entry_point_in_ram {
-            tracing::info!("entry point in RAM");
-            //session.core(core_id)?.halt(Duration::from_millis(100))?;
             session.ram_flash_start(flash_info.entry_point.unwrap())?;
-            session.core(core_id)?.run()?;
         }
 
         flash_info.entry_point_in_ram
@@ -261,7 +254,11 @@ fn main_try(args: &[OsString], offset: UtcOffset) -> Result<()> {
         false
     };
 
-    if !ram_flash && config.reset.enabled {
+    let core_id = rtt::get_target_core_id(&mut session, &path);
+
+    if ram_flash {
+        session.core(core_id)?.run()?;
+    } else if config.reset.enabled {
         let mut core = session.core(core_id)?;
         let halt_timeout = Duration::from_millis(500);
         if config.reset.halt_afterwards {

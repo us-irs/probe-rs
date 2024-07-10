@@ -115,10 +115,7 @@ impl Cmd {
                 self.shared_options.chip_erase,
             )?;
 
-            tracing::info!("flash download done");
             if flash_info.entry_point_in_ram {
-                tracing::info!("entry point in RAM");
-                session.core(core_id)?.halt(Duration::from_millis(100))?;
                 session.ram_flash_start(flash_info.entry_point.unwrap())?;
             } else {
                 // reset the core to leave it in a consistent state after flashing
