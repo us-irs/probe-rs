@@ -100,7 +100,6 @@ impl Cmd {
         let core_id = rtt::get_target_core_id(&mut session, &self.shared_options.path);
 
         if run_download {
-            session.core(core_id)?.halt(Duration::from_millis(100))?;
             let loader = build_loader(
                 &mut session,
                 &self.shared_options.path,

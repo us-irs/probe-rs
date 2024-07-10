@@ -34,7 +34,6 @@ impl ArmDebugSequence for Va416xx {
         _debug_base: Option<u64>,
         _cti_base: Option<u64>,
     ) -> Result<(), ArmError> {
-        tracing::info!("vorago specific debug core start");
         let mut core = interface.memory_interface(&core_ap)?;
         cortex_m_core_start(&mut *core)?;
         // Disable ROM protection

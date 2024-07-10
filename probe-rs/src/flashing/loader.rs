@@ -5,11 +5,11 @@ use probe_rs_target::{
     InstructionSet, MemoryRange, MemoryRegion, NvmRegion, RawFlashAlgorithm,
     TargetDescriptionSource,
 };
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::str::FromStr;
+use std::time::Duration;
 
 use super::builder::FlashBuilder;
 use super::{
@@ -22,9 +22,12 @@ use crate::memory::MemoryInterface;
 use crate::session::Session;
 use crate::Target;
 
+/// Information about the flashing process result.
 #[derive(Debug, Default)]
 pub struct FlashCommitInfo {
+    /// This will be [true] if the entry point of the application is inside a RAM region.
     pub entry_point_in_ram: bool,
+    /// This will have hold the address of the entry point if the entry point is in RAM.
     pub entry_point: Option<u64>,
 }
 
@@ -553,6 +556,13 @@ impl FlashLoader {
                 .unwrap();
             // Attach to memory and core.
             let mut core = session.core(region_core_index).map_err(FlashError::Core)?;
+
+            // If this is a RAM only flash, the core might still be running. This can be
+            // problematic if the instruction RAM is flashed while an application is running, so
+            // the core is halted here in any case.
+            if !core.core_halted().map_err(FlashError::Core)? {
+                core.halt(Duration::from_secs(100)).map_err(FlashError::Core)?;
+            }
 
             let mut some = false;
             for (address, data) in self.builder.data_in_range(&region.range) {
