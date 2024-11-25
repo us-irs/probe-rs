@@ -51,6 +51,7 @@ variants:
     - main
     access:
       boot: true
+      write: true
   - !Ram
     name: DRAM
     range:

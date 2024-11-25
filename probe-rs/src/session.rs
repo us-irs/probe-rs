@@ -209,7 +209,7 @@ impl Session {
         probe.attach_to_unspecified()?;
         if probe.scan_chain().iter().len() > 0 {
             for core in &cores {
-                probe.select_jtag_tap(core.interface_idx()).ok();
+                probe.select_jtag_tap(core.interface_idx())?;
             }
         }
 
