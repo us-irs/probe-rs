@@ -208,6 +208,7 @@ fn create_core(processor: &Processor) -> Result<ProbeCore> {
                     AccessPort::Index(id) => probe_rs_target::ApAddress::V1(id),
                     AccessPort::Address(addr) => probe_rs_target::ApAddress::V2(addr),
                 },
+                mem_ap: None,
                 targetsel: None,
                 debug_base: None,
                 cti_base: None,

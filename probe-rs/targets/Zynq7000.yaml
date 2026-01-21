@@ -24,6 +24,7 @@ variants:
       type: armv7a
       core_access_options: !Arm
         ap: !v1 1
+        mem_ap: !v1 0
         debug_base: 0x80090000
         cti_base: 0x80098000
         jtag_tap: 1
@@ -31,6 +32,7 @@ variants:
       type: armv7a
       core_access_options: !Arm
         ap: !v1 1
+        mem_ap: !v1 0
         debug_base: 0x80092000
         cti_base: 0x80099000
         jtag_tap: 1
