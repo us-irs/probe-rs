@@ -680,16 +680,10 @@ impl FlashLoader {
         region_core_index: usize,
         ranges_in_region: &[(u64, &[u8])],
     ) -> Result<bool, FlashError> {
-        tracing::info!(
-            "    -- region core index and core {:?} and options {:?}",
-            region_core_index,
-            session.target().cores[region_core_index].core_access_options
-        );
         if let CoreAccessOptions::Arm(options) =
             &session.target().cores[region_core_index].core_access_options
             && let Some(mem_ap) = &options.mem_ap
         {
-            tracing::info!("    -- ARM core and mem ap");
             let fully_qualified_mem_ap = match mem_ap {
                 probe_rs_target::ApAddress::V1(ap) => {
                     FullyQualifiedApAddress::v1_with_default_dp(*ap)
