@@ -3,7 +3,7 @@ use espflash::image_format::idf::{IdfBootloaderFormat, check_idf_bootloader};
 use ihex::Record;
 use itertools::Itertools as _;
 use probe_rs_target::{
-    InstructionSet, MemoryRange, MemoryRegion, NvmRegion, RawFlashAlgorithm,
+    CoreAccessOptions, InstructionSet, MemoryRange, MemoryRegion, NvmRegion, RawFlashAlgorithm,
     TargetDescriptionSource,
 };
 use std::io::{Read, Seek, SeekFrom};
@@ -17,6 +17,7 @@ use super::{
     extract_from_elf,
 };
 use crate::Target;
+use crate::architecture::arm::{ApV2Address, FullyQualifiedApAddress};
 use crate::flashing::progress::ProgressOperation;
 use crate::flashing::{FlashLayout, FlashProgress, Format};
 use crate::memory::MemoryInterface;
@@ -625,19 +626,32 @@ impl FlashLoader {
                 )
                 .unwrap();
 
-            // Attach to memory and core.
-            let mut core = session.core(region_core_index).map_err(FlashError::Core)?;
+            // Check whether core is halted.
+            {
+                let mut core = session.core(region_core_index).map_err(FlashError::Core)?;
 
-            // If this is a RAM only flash, the core might still be running. This can be
-            // problematic if the instruction RAM is flashed while an application is running, so
-            // the core is halted here in any case.
-            if !core.core_halted().map_err(FlashError::Core)? {
-                tracing::debug!(
-                    "     -- action: core is not halted and RAM is being written, halting"
-                );
-                core.halt(Duration::from_millis(500))
-                    .map_err(FlashError::Core)?;
+                // If this is a RAM only flash, the core might still be running. This can be
+                // problematic if the instruction RAM is flashed while an application is running, so
+                // the core is halted here in any case.
+                if !core.core_halted().map_err(FlashError::Core)? {
+                    tracing::debug!(
+                        "     -- action: core is not halted and RAM is being written, halting"
+                    );
+                    core.halt(Duration::from_millis(500))
+                        .map_err(FlashError::Core)?;
+                }
+                drop(core);
             }
+
+            if self.ram_flash_with_alternative_memory_access_port(
+                session,
+                region_core_index,
+                &ranges_in_region,
+            )? {
+                return Ok(());
+            }
+
+            let mut core = session.core(region_core_index).map_err(FlashError::Core)?;
 
             for (address, data) in ranges_in_region {
                 tracing::debug!(
@@ -656,6 +670,56 @@ impl FlashLoader {
         }
 
         Ok(())
+    }
+
+    // Some systems have an alternative memory access port which is faster or preferrable for
+    // RAM flashing for other reasons.
+    fn ram_flash_with_alternative_memory_access_port(
+        &self,
+        session: &mut Session,
+        region_core_index: usize,
+        ranges_in_region: &[(u64, &[u8])],
+    ) -> Result<bool, FlashError> {
+        tracing::info!(
+            "    -- region core index and core {:?} and options {:?}",
+            region_core_index,
+            session.target().cores[region_core_index].core_access_options
+        );
+        if let CoreAccessOptions::Arm(options) =
+            &session.target().cores[region_core_index].core_access_options
+            && let Some(mem_ap) = &options.mem_ap
+        {
+            tracing::info!("    -- ARM core and mem ap");
+            let fully_qualified_mem_ap = match mem_ap {
+                probe_rs_target::ApAddress::V1(ap) => {
+                    FullyQualifiedApAddress::v1_with_default_dp(*ap)
+                }
+                probe_rs_target::ApAddress::V2(ap) => {
+                    FullyQualifiedApAddress::v2_with_default_dp(ApV2Address::new(*ap))
+                }
+            };
+
+            tracing::debug!("    -- RAM flash on memory AP {:?}", fully_qualified_mem_ap);
+            let mut memory = session
+                .get_arm_interface()
+                .map_err(|e| FlashError::Core(crate::error::Error::Arm(e)))?
+                .memory_interface(&fully_qualified_mem_ap)
+                .map_err(|e| FlashError::Core(crate::error::Error::Arm(e)))?;
+            for (address, data) in ranges_in_region {
+                tracing::debug!(
+                    "     -- writing: {:#010X}..{:#010X} ({} bytes)",
+                    address,
+                    address + data.len() as u64,
+                    data.len()
+                );
+                // Write data to memory.
+                memory
+                    .write(*address, data)
+                    .map_err(|e| FlashError::Core(crate::error::Error::Arm(e)))?;
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn prepare_plan(

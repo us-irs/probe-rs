@@ -194,6 +194,9 @@ impl Default for ApAddress {
 pub struct ArmCoreAccessOptions {
     /// The access port number to access the core
     pub ap: ApAddress,
+    /// Some ARM targets have an alternative memory access port number which allows faster
+    /// memory access without the need to halt the core.
+    pub mem_ap: Option<ApAddress>,
     /// The TARGETSEL value used to access the core
     #[serde(serialize_with = "hex_option")]
     pub targetsel: Option<u32>,
