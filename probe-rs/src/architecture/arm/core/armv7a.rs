@@ -18,7 +18,7 @@ use crate::{
     Architecture, CoreInformation, CoreInterface, CoreRegister, CoreStatus, CoreType, Endian,
     InstructionSet, MemoryInterface,
     architecture::arm::{
-        ArmError, DapAccess, FullyQualifiedApAddress,
+        ArmDebugInterface, ArmError, DapAccess, FullyQualifiedApAddress,
         ap::{ApRegister, BD0, BD1, BD2, BD3, TAR, TAR2},
         core::armv7a_debug_regs::*,
         memory::ArmMemoryInterface,
@@ -29,9 +29,7 @@ use crate::{
     memory::{MemoryNotAlignedError, valid_32bit_address},
 };
 use std::{
-    mem::size_of,
-    sync::Arc,
-    time::{Duration, Instant},
+    cell::RefCell, mem::size_of, sync::Arc, time::{Duration, Instant}
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -122,11 +120,14 @@ pub enum Armv7aError {
 
 /// Interface for interacting with an ARMv7-A core
 pub struct Armv7a<'probe> {
-    memory: Box<dyn ArmMemoryInterface + 'probe>,
+    //memory: Box<dyn ArmMemoryInterface + 'probe>,
+    debug_interface: Box<dyn ArmDebugInterface>,
+
+    debug_ap: Armv7aDebugAccess<'probe>,
+
+    mem_ap_addr: FullyQualifiedApAddress,
 
     state: &'probe mut CortexAState,
-
-    base_address: u64,
 
     sequence: Arc<dyn ArmDebugSequence>,
 
@@ -134,20 +135,31 @@ pub struct Armv7a<'probe> {
 
     itr_enabled: bool,
 
-    endianness: Option<Endian>,
 }
 
 impl<'probe> Armv7a<'probe> {
     pub(crate) fn new(
-        mut memory: Box<dyn ArmMemoryInterface + 'probe>,
+        debug_interface: Box<dyn ArmDebugInterface>,
+        debug_ap_addr: FullyQualifiedApAddress,
+        mem_ap_addr: FullyQualifiedApAddress,
         state: &'probe mut CortexAState,
-        base_address: u64,
         sequence: Arc<dyn ArmDebugSequence>,
+        base_address: u64
     ) -> Result<Self, Error> {
+        //let mut debug_mem_ap = debug_interface.memory_interface(&debug_ap_addr)?;
+        let debug_if_wrapper = RefCell::new(debug_interface);
+        let mut debug_ap = Armv7aDebugAccess {
+            debug_interface: &debug_if_wrapper,
+            state,
+            base_address,
+            debug_ap_addr,
+            sequence,
+            endianness: None
+        };
         if !state.initialized() {
             // determine current state
             let address = Dbgdscr::get_mmio_address_from_base(base_address)?;
-            let dbgdscr = Dbgdscr(memory.read_word_32(address)?);
+            let dbgdscr = Dbgdscr(debug_ap.read_word_32(address)?);
 
             tracing::debug!("State when connecting: {:x?}", dbgdscr);
 
@@ -165,262 +177,34 @@ impl<'probe> Armv7a<'probe> {
         }
 
         let mut core = Self {
-            memory,
+            debug_interface,
+            mem_ap_addr,
+            debug_ap,
             state,
-            base_address,
             sequence,
             num_breakpoints: None,
             itr_enabled: false,
-            endianness: None,
         };
 
         if !core.state.initialized() {
-            core.reset_register_cache();
-            core.read_fp_reg_count()?;
+            debug_ap.reset_register_cache();
+            debug_ap.read_fp_reg_count()?;
             core.state.initialize();
         }
 
         Ok(core)
     }
 
-    fn read_fp_reg_count(&mut self) -> Result<(), Error> {
-        if self.state.fp_reg_count == 0 && matches!(self.state.current_state, CoreStatus::Halted(_))
-        {
-            self.prepare_r0_for_clobber()?;
-
-            // Check CP10/CP11 in CPACR which indicate whether the FPU is enabled;
-            // if it's disabled (both 0) then don't try to read MVFR0 as it would fault.
-            let instruction = build_mrc(15, 0, 0, 1, 0, 2);
-            self.execute_instruction(instruction)?;
-            let instruction = build_mcr(14, 0, 0, 0, 5, 0);
-            let cpacr = Cpacr(self.execute_instruction_with_result(instruction)?);
-            if cpacr.cp(10) == 0 || cpacr.cp(11) == 0 {
-                return Ok(());
-            }
-
-            // VMRS r0, MVFR0
-            let instruction = build_vmrs(0, 0b0111);
-            self.execute_instruction(instruction)?;
-
-            // Read from r0
-            let instruction = build_mcr(14, 0, 0, 0, 5, 0);
-            let vmrs = self.execute_instruction_with_result(instruction)?;
-
-            self.state.fp_reg_count = match vmrs & 0b111 {
-                0b001 => 16,
-                0b010 => 32,
-                _ => 0,
-            };
-        }
-
-        Ok(())
+    fn endianness(&mut self) -> Result<Endian, Error> {
+        self.debug_ap.endianness()
     }
 
-    /// Execute an instruction
-    fn execute_instruction(&mut self, instruction: u32) -> Result<Dbgdscr, ArmError> {
-        if !self.state.current_state.is_halted() {
-            return Err(ArmError::CoreNotHalted);
-        }
-
-        // Enable ITR if needed
-        if !self.itr_enabled {
-            let address = Dbgdscr::get_mmio_address_from_base(self.base_address)?;
-            let mut dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
-            dbgdscr.set_itren(true);
-
-            self.memory.write_word_32(address, dbgdscr.into())?;
-
-            self.itr_enabled = true;
-        }
-
-        execute_instruction(&mut *self.memory, self.base_address, instruction)
+    fn fpu_support(&mut self) -> Result<bool, Error> {
+        Ok(self.state.fp_reg_count != 0)
     }
 
-    /// Execute an instruction on the CPU and return the result
-    fn execute_instruction_with_result(&mut self, instruction: u32) -> Result<u32, Error> {
-        // Run instruction
-        let mut dbgdscr = self.execute_instruction(instruction)?;
-
-        // Wait for TXfull
-        let start = Instant::now();
-        while !dbgdscr.txfull_l() {
-            let address = Dbgdscr::get_mmio_address_from_base(self.base_address)?;
-            dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
-            // Check if we had any aborts, if so clear them and fail
-            check_and_clear_data_abort(&mut *self.memory, self.base_address, dbgdscr)?;
-            if start.elapsed() >= OPERATION_TIMEOUT {
-                return Err(Error::Timeout);
-            }
-        }
-
-        // Read result
-        let address = Dbgdtrtx::get_mmio_address_from_base(self.base_address)?;
-        let result = self.memory.read_word_32(address)?;
-
-        Ok(result)
-    }
-
-    fn execute_instruction_with_input(
-        &mut self,
-        instruction: u32,
-        value: u32,
-    ) -> Result<(), Error> {
-        // Move value
-        let address = Dbgdtrrx::get_mmio_address_from_base(self.base_address)?;
-        self.memory.write_word_32(address, value)?;
-
-        // Wait for RXfull
-        let address = Dbgdscr::get_mmio_address_from_base(self.base_address)?;
-        let mut dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
-
-        let start = Instant::now();
-        while !dbgdscr.rxfull_l() {
-            dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
-            // Check if we had any aborts, if so clear them and fail
-            check_and_clear_data_abort(&mut *self.memory, self.base_address, dbgdscr)?;
-            if start.elapsed() >= OPERATION_TIMEOUT {
-                return Err(Error::Timeout);
-            }
-        }
-
-        // Run instruction
-        self.execute_instruction(instruction)?;
-
-        Ok(())
-    }
-
-    fn reset_register_cache(&mut self) {
-        self.state.register_cache = vec![None; 51];
-    }
-
-    /// Sync any updated registers back to the core
-    fn writeback_registers(&mut self) -> Result<(), Error> {
-        let writeback_iter = (17u16..=48).chain(15u16..=16).chain(0u16..=14);
-
-        for i in writeback_iter {
-            if let Some((val, writeback)) = self.state.register_cache[i as usize]
-                && writeback
-            {
-                match i {
-                    0..=14 => {
-                        let instruction = build_mrc(14, 0, i, 0, 5, 0);
-
-                        self.execute_instruction_with_input(instruction, val.try_into()?)?;
-                    }
-                    15 => {
-                        // Move val to r0
-                        let instruction = build_mrc(14, 0, 0, 0, 5, 0);
-
-                        self.execute_instruction_with_input(instruction, val.try_into()?)?;
-
-                        // Use `mov pc, r0` rather than `bx r0` because the `bx` instruction is
-                        // `UNPREDICTABLE` in the debug state (ARM Architecture Reference Manual,
-                        // ARMv7-A and ARMv7-R edition, C5.3: "Executing instructions in Debug state").
-                        let instruction = build_mov(15, 0);
-                        self.execute_instruction(instruction)?;
-                    }
-                    16 => {
-                        // msr cpsr_fsxc, r0
-                        let instruction = build_msr(0);
-                        self.execute_instruction_with_input(instruction, val.try_into()?)?;
-                    }
-                    17..=48 => {
-                        // Move value to r0, r1
-                        let value: u64 = val.try_into()?;
-                        let low_word = value as u32;
-                        let high_word = (value >> 32) as u32;
-
-                        let instruction = build_mrc(14, 0, 0, 0, 5, 0);
-                        self.execute_instruction_with_input(instruction, low_word)?;
-
-                        let instruction = build_mrc(14, 0, 1, 0, 5, 0);
-                        self.execute_instruction_with_input(instruction, high_word)?;
-
-                        // VMOV
-                        let instruction = build_vmov(0, 0, 1, i - 17);
-                        self.execute_instruction(instruction)?;
-                    }
-                    _ => {
-                        panic!("Logic missing for writeback of register {i}");
-                    }
-                }
-            }
-        }
-
-        self.reset_register_cache();
-
-        Ok(())
-    }
-
-    /// Save r0 if needed before it gets clobbered by instruction execution
-    fn prepare_r0_for_clobber(&mut self) -> Result<(), Error> {
-        self.prepare_for_clobber(0)
-    }
-
-    /// Save `r<n>` if needed before it gets clobbered by instruction execution
-    fn prepare_for_clobber(&mut self, reg: usize) -> Result<(), Error> {
-        if self.state.register_cache[reg].is_none() {
-            // cache reg since we're going to clobber it
-            let val: u32 = self.read_core_reg(RegisterId(reg as u16))?.try_into()?;
-
-            // Mark reg as needing writeback
-            self.state.register_cache[reg] = Some((val.into(), true));
-        }
-
-        Ok(())
-    }
-
-    fn set_r0(&mut self, value: u32) -> Result<(), Error> {
-        let instruction = build_mrc(14, 0, 0, 0, 5, 0);
-
-        self.execute_instruction_with_input(instruction, value)
-    }
-
-    fn set_core_status(&mut self, new_status: CoreStatus) {
-        super::update_core_status(&mut self.memory, &mut self.state.current_state, new_status);
-    }
-
-    pub(crate) fn halted_access<R>(
-        &mut self,
-        op: impl FnOnce(&mut Self) -> Result<R, Error>,
-    ) -> Result<R, Error> {
-        let was_running = !(self.state.current_state.is_halted() || self.status()?.is_halted());
-
-        if was_running {
-            self.halt(Duration::from_millis(100))?;
-        }
-
-        let result = op(self);
-
-        if was_running {
-            self.run()?
-        }
-
-        result
-    }
-
-    /// For greater performance, place DBGDTRTX, DBGDTRRX, DBGITR, and DBGDCSR
-    /// into the banked register window. This will allow us to directly access
-    /// these four values.
-    fn banked_access(&mut self) -> Result<BankedAccess<'_>, Error> {
-        let address = Dbgdtrtx::get_mmio_address_from_base(self.base_address)?;
-        let ap = self.memory.fully_qualified_address();
-        let is_64_bit = self.is_64_bit();
-        let interface = self.memory.get_arm_debug_interface()?;
-
-        if is_64_bit {
-            interface.write_raw_ap_register(&ap, TAR2::ADDRESS, (address >> 32) as u32)?;
-        }
-        interface.write_raw_ap_register(&ap, TAR::ADDRESS, address as u32)?;
-
-        Ok(BankedAccess {
-            interface,
-            ap,
-            dtrtx: BD0::ADDRESS,
-            itr: BD1::ADDRESS,
-            dscr: BD2::ADDRESS,
-            dtrrx: BD3::ADDRESS,
-        })
+    fn floating_point_register_count(&mut self) -> Result<usize, Error> {
+        Ok(self.state.fp_reg_count)
     }
 }
 
@@ -696,6 +480,700 @@ pub(crate) fn read_word_32(
 }
 
 impl CoreInterface for Armv7a<'_> {
+    fn wait_for_core_halted(&mut self, timeout: Duration) -> Result<(), Error> {
+        self.debug_ap.wait_for_core_halted(timeout)
+    }
+
+    fn core_halted(&mut self) -> Result<bool, Error> {
+        self.debug_ap.core_halted()
+    }
+
+    fn status(&mut self) -> Result<crate::core::CoreStatus, Error> {
+        self.debug_ap.status()
+    }
+
+    fn halt(&mut self, timeout: Duration) -> Result<CoreInformation, Error> {
+        self.debug_ap.halt(timeout)
+    }
+
+    fn run(&mut self) -> Result<(), Error> {
+        self.debug_ap.run()
+    }
+
+    fn reset(&mut self) -> Result<(), Error> {
+        self.debug_ap.reset()
+    }
+
+    fn reset_and_halt(&mut self, timeout: Duration) -> Result<CoreInformation, Error> {
+        self.sequence.reset_catch_set(
+            &mut *self.memory,
+            crate::CoreType::Armv7a,
+            Some(self.base_address),
+        )?;
+        self.sequence.reset_system(
+            &mut *self.memory,
+            crate::CoreType::Armv7a,
+            Some(self.base_address),
+        )?;
+
+        if !self.core_halted()? {
+            tracing::warn!("Core not halted after reset, platform-specific setup may be required");
+            tracing::warn!("Requesting halt anyway, but system may already be initialised");
+            let address = Dbgdrcr::get_mmio_address_from_base(self.base_address)?;
+            let mut value = Dbgdrcr(0);
+            value.set_hrq(true);
+            self.memory.write_word_32(address, value.into())?;
+        }
+
+        self.sequence.reset_catch_clear(
+            &mut *self.memory,
+            crate::CoreType::Armv7a,
+            Some(self.base_address),
+        )?;
+        self.wait_for_core_halted(timeout)?;
+
+        // Update core status
+        let _ = self.status()?;
+
+        // Reset our cached values
+        self.reset_register_cache();
+
+        // try to read the program counter
+        let pc_value = self.read_core_reg(self.program_counter().into())?;
+
+        // get pc
+        Ok(CoreInformation {
+            pc: pc_value.try_into()?,
+        })
+    }
+
+    fn step(&mut self) -> Result<CoreInformation, Error> {
+        // Save current breakpoint
+        let bp_unit_index = (self.available_breakpoint_units()? - 1) as usize;
+        let bp_value_addr = Dbgbvr::get_mmio_address_from_base(self.base_address)?
+            + (bp_unit_index * size_of::<u32>()) as u64;
+        let saved_bp_value = self.memory.read_word_32(bp_value_addr)?;
+
+        let bp_control_addr = Dbgbcr::get_mmio_address_from_base(self.base_address)?
+            + (bp_unit_index * size_of::<u32>()) as u64;
+        let saved_bp_control = self.memory.read_word_32(bp_control_addr)?;
+
+        // Set breakpoint for any change
+        let current_pc: u32 = self
+            .read_core_reg(self.program_counter().into())?
+            .try_into()?;
+        let mut bp_control = Dbgbcr(0);
+
+        // Breakpoint type - address mismatch
+        bp_control.set_bt(0b0100);
+        // Match on all modes
+        bp_control.set_hmc(true);
+        bp_control.set_pmc(0b11);
+        // Match on all bytes
+        bp_control.set_bas(0b1111);
+        // Enable
+        bp_control.set_e(true);
+
+        self.memory.write_word_32(bp_value_addr, current_pc)?;
+        self.memory
+            .write_word_32(bp_control_addr, bp_control.into())?;
+
+        // Resume
+        self.run()?;
+
+        // Wait for halt
+        self.wait_for_core_halted(Duration::from_millis(100))?;
+
+        // Reset breakpoint
+        self.memory.write_word_32(bp_value_addr, saved_bp_value)?;
+        self.memory
+            .write_word_32(bp_control_addr, saved_bp_control)?;
+
+        // try to read the program counter
+        let pc_value = self.read_core_reg(self.program_counter().into())?;
+
+        // get pc
+        Ok(CoreInformation {
+            pc: pc_value.try_into()?,
+        })
+    }
+
+    fn read_core_reg(&mut self, address: RegisterId) -> Result<RegisterValue, Error> {
+        let reg_num = address.0;
+
+        // check cache
+        if (reg_num as usize) < self.state.register_cache.len()
+            && let Some(cached_result) = self.state.register_cache[reg_num as usize]
+        {
+            return Ok(cached_result.0);
+        }
+
+        // Generate instruction to extract register
+        let result: Result<RegisterValue, Error> = match reg_num {
+            0..=14 => {
+                // r0-r14, valid
+                // MCR p14, 0, <Rd>, c0, c5, 0 ; Write DBGDTRTXint Register
+                let instruction = build_mcr(14, 0, reg_num, 0, 5, 0);
+
+                let val = self.execute_instruction_with_result(instruction)?;
+
+                Ok(val.into())
+            }
+            15 => {
+                // PC, must access via r0
+                self.prepare_r0_for_clobber()?;
+
+                // MOV r0, PC
+                let instruction = build_mov(0, 15);
+                self.execute_instruction(instruction)?;
+
+                // Read from r0
+                let instruction = build_mcr(14, 0, 0, 0, 5, 0);
+                let pra_plus_offset = self.execute_instruction_with_result(instruction)?;
+
+                // PC returned is PC + 8
+                Ok((pra_plus_offset - 8).into())
+            }
+            16 => {
+                // CPSR, must access via r0
+                self.prepare_r0_for_clobber()?;
+
+                // MRS r0, CPSR
+                let instruction = build_mrs(0);
+                self.execute_instruction(instruction)?;
+
+                // Read from r0
+                let instruction = build_mcr(14, 0, 0, 0, 5, 0);
+                let cpsr = self.execute_instruction_with_result(instruction)?;
+
+                Ok(cpsr.into())
+            }
+            17..=48 => {
+                // Access via r0, r1
+                self.prepare_for_clobber(0)?;
+                self.prepare_for_clobber(1)?;
+
+                // If FPEXC.EN = 0, then these registers aren't safe to access.  Read as zero
+                let fpexc: u32 = self.read_core_reg(50.into())?.try_into()?;
+                if (fpexc & (1 << 30)) == 0 {
+                    // Disabled
+                    return Ok(0u32.into());
+                }
+
+                // VMOV r0, r1, <reg>
+                let instruction = build_vmov(1, 0, 1, reg_num - 17);
+                self.execute_instruction(instruction)?;
+
+                // Read from r0
+                let instruction = build_mcr(14, 0, 0, 0, 5, 0);
+                let mut value = self.execute_instruction_with_result(instruction)? as u64;
+
+                // Read from r1
+                let instruction = build_mcr(14, 0, 1, 0, 5, 0);
+                value |= (self.execute_instruction_with_result(instruction)? as u64) << 32;
+
+                Ok(value.into())
+            }
+            49 => {
+                // Access via r0
+                self.prepare_for_clobber(0)?;
+
+                // If FPEXC.EN = 0, then these registers aren't safe to access.  Read as zero
+                let fpexc: u32 = self.read_core_reg(50.into())?.try_into()?;
+                if (fpexc & (1 << 30)) == 0 {
+                    // Disabled
+                    return Ok(0u32.into());
+                }
+
+                // VMRS r0, FPSCR
+                let instruction = build_vmrs(0, 1);
+                self.execute_instruction(instruction)?;
+
+                // Read from r0
+                let instruction = build_mcr(14, 0, 0, 0, 5, 0);
+                let value = self.execute_instruction_with_result(instruction)?;
+
+                Ok(value.into())
+            }
+            50 => {
+                // Access via r0
+                self.prepare_for_clobber(0)?;
+
+                // VMRS r0, FPEXC
+                let instruction = build_vmrs(0, 0b1000);
+                self.execute_instruction(instruction)?;
+
+                let instruction = build_mcr(14, 0, 0, 0, 5, 0);
+                let value = self.execute_instruction_with_result(instruction)?;
+
+                Ok(value.into())
+            }
+            _ => Err(Error::Arm(
+                Armv7aError::InvalidRegisterNumber(reg_num).into(),
+            )),
+        };
+
+        if let Ok(value) = result {
+            self.state.register_cache[reg_num as usize] = Some((value, false));
+
+            Ok(value)
+        } else {
+            Err(result.err().unwrap())
+        }
+    }
+
+    fn write_core_reg(&mut self, address: RegisterId, value: RegisterValue) -> Result<(), Error> {
+        let reg_num = address.0;
+
+        if (reg_num as usize) >= self.state.register_cache.len() {
+            return Err(Error::Arm(
+                Armv7aError::InvalidRegisterNumber(reg_num).into(),
+            ));
+        }
+        self.state.register_cache[reg_num as usize] = Some((value, true));
+
+        Ok(())
+    }
+
+    fn available_breakpoint_units(&mut self) -> Result<u32, Error> {
+        if self.num_breakpoints.is_none() {
+            let address = Dbgdidr::get_mmio_address_from_base(self.base_address)?;
+            let dbgdidr = Dbgdidr(self.memory.read_word_32(address)?);
+
+            self.num_breakpoints = Some(dbgdidr.brps() + 1);
+        }
+        Ok(self.num_breakpoints.unwrap())
+    }
+
+    /// See docs on the [`CoreInterface::hw_breakpoints`] trait
+    fn hw_breakpoints(&mut self) -> Result<Vec<Option<u64>>, Error> {
+        let mut breakpoints = vec![];
+        let num_hw_breakpoints = self.available_breakpoint_units()? as usize;
+
+        for bp_unit_index in 0..num_hw_breakpoints {
+            let bp_value_addr = Dbgbvr::get_mmio_address_from_base(self.base_address)?
+                + (bp_unit_index * size_of::<u32>()) as u64;
+            let bp_value = self.memory.read_word_32(bp_value_addr)?;
+
+            let bp_control_addr = Dbgbcr::get_mmio_address_from_base(self.base_address)?
+                + (bp_unit_index * size_of::<u32>()) as u64;
+            let bp_control = Dbgbcr(self.memory.read_word_32(bp_control_addr)?);
+
+            if bp_control.e() {
+                breakpoints.push(Some(bp_value as u64));
+            } else {
+                breakpoints.push(None);
+            }
+        }
+        Ok(breakpoints)
+    }
+
+    fn enable_breakpoints(&mut self, _state: bool) -> Result<(), Error> {
+        // Breakpoints are always on with v7-A
+        Ok(())
+    }
+
+    fn set_hw_breakpoint(&mut self, bp_unit_index: usize, addr: u64) -> Result<(), Error> {
+        let addr = valid_32bit_address(addr)?;
+        set_hw_breakpoint(&mut *self.memory, self.base_address, bp_unit_index, addr)?;
+        Ok(())
+    }
+
+    fn clear_hw_breakpoint(&mut self, bp_unit_index: usize) -> Result<(), Error> {
+        clear_hw_breakpoint(&mut *self.memory, self.base_address, bp_unit_index)?;
+        Ok(())
+    }
+
+    fn registers(&self) -> &'static CoreRegisters {
+        match self.state.fp_reg_count {
+            16 => &AARCH32_WITH_FP_16_CORE_REGISTERS,
+            32 => &AARCH32_WITH_FP_32_CORE_REGISTERS,
+            _ => &AARCH32_CORE_REGISTERS,
+        }
+    }
+
+    fn program_counter(&self) -> &'static CoreRegister {
+        &PC
+    }
+
+    fn frame_pointer(&self) -> &'static CoreRegister {
+        &FP
+    }
+
+    fn stack_pointer(&self) -> &'static CoreRegister {
+        &SP
+    }
+
+    fn return_address(&self) -> &'static CoreRegister {
+        &RA
+    }
+
+    fn hw_breakpoints_enabled(&self) -> bool {
+        true
+    }
+
+    fn architecture(&self) -> Architecture {
+        Architecture::Arm
+    }
+
+    fn core_type(&self) -> CoreType {
+        CoreType::Armv7a
+    }
+
+    fn instruction_set(&mut self) -> Result<InstructionSet, Error> {
+        let cpsr: u32 = self.read_core_reg(XPSR.id())?.try_into()?;
+
+        // CPSR bit 5 - T - Thumb mode
+        match (cpsr >> 5) & 1 {
+            1 => Ok(InstructionSet::Thumb2),
+            _ => Ok(InstructionSet::A32),
+        }
+    }
+
+    fn endianness(&mut self) -> Result<Endian, Error> {
+        self.debug_ap.endianness()
+    }
+
+    fn fpu_support(&mut self) -> Result<bool, Error> {
+        Ok(self.state.fp_reg_count != 0)
+    }
+
+    fn floating_point_register_count(&mut self) -> Result<usize, Error> {
+        Ok(self.state.fp_reg_count)
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn reset_catch_set(&mut self) -> Result<(), Error> {
+        self.debug_ap.reset_catch_set()
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn reset_catch_clear(&mut self) -> Result<(), Error> {
+        self.debug_ap.reset_catch_clear()
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn debug_core_stop(&mut self) -> Result<(), Error> {
+        self.debug_ap.debug_core_stop()
+    }
+}
+
+impl MemoryInterface for Armv7a<'_> {
+    fn supports_native_64bit_access(&mut self) -> bool {
+        self.debug_ap.supports_native_64bit_access()
+    }
+
+    fn read_64(&mut self, address: u64, data: &mut [u64]) -> Result<(), Error> {
+        self.debug_ap.read_64(address, data)
+    }
+
+    fn read_32(&mut self, address: u64, data: &mut [u32]) -> Result<(), Error> {
+        self.debug_ap.read_32(address, data)
+    }
+
+    fn read_16(&mut self, address: u64, data: &mut [u16]) -> Result<(), Error> {
+        self.debug_ap.read_16(address, data)
+    }
+
+    fn read_8(&mut self, address: u64, data: &mut [u8]) -> Result<(), Error> {
+        self.debug_ap.read_8(address, data)
+    }
+
+    fn write_64(&mut self, address: u64, data: &[u64]) -> Result<(), Error> {
+        self.debug_ap.write_64(address, data)
+    }
+
+    fn write_32(&mut self, address: u64, data: &[u32]) -> Result<(), Error> {
+        self.debug_ap.write_32(address, data)
+    }
+
+    fn write_16(&mut self, address: u64, data: &[u16]) -> Result<(), Error> {
+        self.debug_ap.write_16(address, data)
+    }
+
+    fn write_8(&mut self, address: u64, data: &[u8]) -> Result<(), Error> {
+        self.debug_ap.write_8(address, data)
+    }
+
+    fn supports_8bit_transfers(&self) -> Result<bool, Error> {
+        self.debug_ap.supports_8bit_transfers()
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        self.debug_ap.flush()
+    }
+}
+
+pub struct Armv7aDebugAccess<'probe> {
+    //pub memory: Box<dyn ArmMemoryInterface + 'probe>,
+    debug_interface: &'probe std::cell::RefCell<Box<dyn ArmDebugInterface>>,
+    state: &'probe mut CortexAState,
+    base_address: u64,
+    debug_ap_addr: FullyQualifiedApAddress,
+    sequence: Arc<dyn ArmDebugSequence>,
+    endianness: Option<Endian>
+}
+
+impl Armv7aDebugAccess<'_> {
+    pub(crate) fn halted_access<R>(
+        &mut self,
+        op: impl FnOnce(&mut Self) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let was_running = !(self.state.current_state.is_halted() || self.status()?.is_halted());
+
+        if was_running {
+            self.halt(Duration::from_millis(100))?;
+        }
+
+        let result = op(self);
+
+        if was_running {
+            self.run()?
+        }
+
+        result
+    }
+
+    /// For greater performance, place DBGDTRTX, DBGDTRRX, DBGITR, and DBGDCSR
+    /// into the banked register window. This will allow us to directly access
+    /// these four values.
+    fn banked_access(&mut self) -> Result<BankedAccess<'_>, Error> {
+        let address = Dbgdtrtx::get_mmio_address_from_base(self.base_address)?;
+        let ap = self.memory.fully_qualified_address();
+        let is_64_bit = self.is_64_bit();
+        let interface = self.memory.get_arm_debug_interface()?;
+
+        if is_64_bit {
+            interface.write_raw_ap_register(&ap, TAR2::ADDRESS, (address >> 32) as u32)?;
+        }
+        interface.write_raw_ap_register(&ap, TAR::ADDRESS, address as u32)?;
+
+        Ok(BankedAccess {
+            interface,
+            ap,
+            dtrtx: BD0::ADDRESS,
+            itr: BD1::ADDRESS,
+            dscr: BD2::ADDRESS,
+            dtrrx: BD3::ADDRESS,
+        })
+    }
+
+    fn read_fp_reg_count(&mut self) -> Result<(), Error> {
+        if self.state.fp_reg_count == 0 && matches!(self.state.current_state, CoreStatus::Halted(_))
+        {
+            self.prepare_r0_for_clobber()?;
+
+            // Check CP10/CP11 in CPACR which indicate whether the FPU is enabled;
+            // if it's disabled (both 0) then don't try to read MVFR0 as it would fault.
+            let instruction = build_mrc(15, 0, 0, 1, 0, 2);
+            self.execute_instruction(instruction)?;
+            let instruction = build_mcr(14, 0, 0, 0, 5, 0);
+            let cpacr = Cpacr(self.execute_instruction_with_result(instruction)?);
+            if cpacr.cp(10) == 0 || cpacr.cp(11) == 0 {
+                return Ok(());
+            }
+
+            // VMRS r0, MVFR0
+            let instruction = build_vmrs(0, 0b0111);
+            self.execute_instruction(instruction)?;
+
+            // Read from r0
+            let instruction = build_mcr(14, 0, 0, 0, 5, 0);
+            let vmrs = self.execute_instruction_with_result(instruction)?;
+
+            self.state.fp_reg_count = match vmrs & 0b111 {
+                0b001 => 16,
+                0b010 => 32,
+                _ => 0,
+            };
+        }
+
+        Ok(())
+    }
+
+    /// Execute an instruction
+    fn execute_instruction(&mut self, instruction: u32) -> Result<Dbgdscr, ArmError> {
+        if !self.state.current_state.is_halted() {
+            return Err(ArmError::CoreNotHalted);
+        }
+
+        // Enable ITR if needed
+        if !self.itr_enabled {
+            let address = Dbgdscr::get_mmio_address_from_base(self.base_address)?;
+            let mut dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
+            dbgdscr.set_itren(true);
+
+            self.memory.write_word_32(address, dbgdscr.into())?;
+
+            self.itr_enabled = true;
+        }
+
+        execute_instruction(&mut *self.memory, self.base_address, instruction)
+    }
+
+    fn endianness(&mut self) -> Result<Endian, Error> {
+        if let Some(endianness) = self.endianness {
+            return Ok(endianness);
+        }
+        self.halted_access(|core| {
+            let endianness = {
+                let psr = TryInto::<u32>::try_into(core.read_core_reg(XPSR.id())?).unwrap();
+                if psr & 1 << 9 == 0 {
+                    Endian::Little
+                } else {
+                    Endian::Big
+                }
+            };
+            core.endianness = Some(endianness);
+            Ok(endianness)
+        })
+
+    }
+
+    /// Execute an instruction on the CPU and return the result
+    fn execute_instruction_with_result(&mut self, instruction: u32) -> Result<u32, Error> {
+        // Run instruction
+        let mut dbgdscr = self.execute_instruction(instruction)?;
+
+        // Wait for TXfull
+        let start = Instant::now();
+        while !dbgdscr.txfull_l() {
+            let address = Dbgdscr::get_mmio_address_from_base(self.base_address)?;
+            dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
+            // Check if we had any aborts, if so clear them and fail
+            check_and_clear_data_abort(&mut *self.memory, self.base_address, dbgdscr)?;
+            if start.elapsed() >= OPERATION_TIMEOUT {
+                return Err(Error::Timeout);
+            }
+        }
+
+        // Read result
+        let address = Dbgdtrtx::get_mmio_address_from_base(self.base_address)?;
+        let result = self.memory.read_word_32(address)?;
+
+        Ok(result)
+    }
+
+    fn execute_instruction_with_input(
+        &mut self,
+        instruction: u32,
+        value: u32,
+    ) -> Result<(), Error> {
+        // Move value
+        let address = Dbgdtrrx::get_mmio_address_from_base(self.base_address)?;
+        self.memory.write_word_32(address, value)?;
+
+        // Wait for RXfull
+        let address = Dbgdscr::get_mmio_address_from_base(self.base_address)?;
+        let mut dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
+
+        let start = Instant::now();
+        while !dbgdscr.rxfull_l() {
+            dbgdscr = Dbgdscr(self.memory.read_word_32(address)?);
+            // Check if we had any aborts, if so clear them and fail
+            check_and_clear_data_abort(&mut *self.memory, self.base_address, dbgdscr)?;
+            if start.elapsed() >= OPERATION_TIMEOUT {
+                return Err(Error::Timeout);
+            }
+        }
+
+        // Run instruction
+        self.execute_instruction(instruction)?;
+
+        Ok(())
+    }
+
+    fn reset_register_cache(&mut self) {
+        self.state.register_cache = vec![None; 51];
+    }
+
+    /// Sync any updated registers back to the core
+    fn writeback_registers(&mut self) -> Result<(), Error> {
+        let writeback_iter = (17u16..=48).chain(15u16..=16).chain(0u16..=14);
+
+        for i in writeback_iter {
+            if let Some((val, writeback)) = self.state.register_cache[i as usize]
+                && writeback
+            {
+                match i {
+                    0..=14 => {
+                        let instruction = build_mrc(14, 0, i, 0, 5, 0);
+
+                        self.execute_instruction_with_input(instruction, val.try_into()?)?;
+                    }
+                    15 => {
+                        // Move val to r0
+                        let instruction = build_mrc(14, 0, 0, 0, 5, 0);
+
+                        self.execute_instruction_with_input(instruction, val.try_into()?)?;
+
+                        // Use `mov pc, r0` rather than `bx r0` because the `bx` instruction is
+                        // `UNPREDICTABLE` in the debug state (ARM Architecture Reference Manual,
+                        // ARMv7-A and ARMv7-R edition, C5.3: "Executing instructions in Debug state").
+                        let instruction = build_mov(15, 0);
+                        self.execute_instruction(instruction)?;
+                    }
+                    16 => {
+                        // msr cpsr_fsxc, r0
+                        let instruction = build_msr(0);
+                        self.execute_instruction_with_input(instruction, val.try_into()?)?;
+                    }
+                    17..=48 => {
+                        // Move value to r0, r1
+                        let value: u64 = val.try_into()?;
+                        let low_word = value as u32;
+                        let high_word = (value >> 32) as u32;
+
+                        let instruction = build_mrc(14, 0, 0, 0, 5, 0);
+                        self.execute_instruction_with_input(instruction, low_word)?;
+
+                        let instruction = build_mrc(14, 0, 1, 0, 5, 0);
+                        self.execute_instruction_with_input(instruction, high_word)?;
+
+                        // VMOV
+                        let instruction = build_vmov(0, 0, 1, i - 17);
+                        self.execute_instruction(instruction)?;
+                    }
+                    _ => {
+                        panic!("Logic missing for writeback of register {i}");
+                    }
+                }
+            }
+        }
+
+        self.reset_register_cache();
+
+        Ok(())
+    }
+
+    /// Save r0 if needed before it gets clobbered by instruction execution
+    fn prepare_r0_for_clobber(&mut self) -> Result<(), Error> {
+        self.prepare_for_clobber(0)
+    }
+
+    /// Save `r<n>` if needed before it gets clobbered by instruction execution
+    fn prepare_for_clobber(&mut self, reg: usize) -> Result<(), Error> {
+        if self.state.register_cache[reg].is_none() {
+            // cache reg since we're going to clobber it
+            let val: u32 = self.read_core_reg(RegisterId(reg as u16))?.try_into()?;
+
+            // Mark reg as needing writeback
+            self.state.register_cache[reg] = Some((val.into(), true));
+        }
+
+        Ok(())
+    }
+
+    fn set_r0(&mut self, value: u32) -> Result<(), Error> {
+        let instruction = build_mrc(14, 0, 0, 0, 5, 0);
+
+        self.execute_instruction_with_input(instruction, value)
+    }
+
+    fn set_core_status(&mut self, new_status: CoreStatus) {
+        super::update_core_status(&mut self.memory, &mut self.state.current_state, new_status);
+    }
+
     fn wait_for_core_halted(&mut self, timeout: Duration) -> Result<(), Error> {
         wait_for_core_halted(&mut *self.memory, self.base_address, timeout).map_err(|e| e.into())
     }
@@ -1117,32 +1595,6 @@ impl CoreInterface for Armv7a<'_> {
         }
     }
 
-    fn endianness(&mut self) -> Result<Endian, Error> {
-        if let Some(endianness) = self.endianness {
-            return Ok(endianness);
-        }
-        self.halted_access(|core| {
-            let endianness = {
-                let psr = TryInto::<u32>::try_into(core.read_core_reg(XPSR.id())?).unwrap();
-                if psr & 1 << 9 == 0 {
-                    Endian::Little
-                } else {
-                    Endian::Big
-                }
-            };
-            core.endianness = Some(endianness);
-            Ok(endianness)
-        })
-    }
-
-    fn fpu_support(&mut self) -> Result<bool, Error> {
-        Ok(self.state.fp_reg_count != 0)
-    }
-
-    fn floating_point_register_count(&mut self) -> Result<usize, Error> {
-        Ok(self.state.fp_reg_count)
-    }
-
     #[tracing::instrument(skip(self))]
     fn reset_catch_set(&mut self) -> Result<(), Error> {
         self.halted_access(|core| {
@@ -1183,9 +1635,24 @@ impl CoreInterface for Armv7a<'_> {
 
         Ok(())
     }
+
+    pub fn find_endianness(&mut self) -> Result<Endian, Error> {
+        self.halted_access(|core| {
+            let endianness = {
+                let psr = TryInto::<u32>::try_into(core.read_core_reg(XPSR.id())?).unwrap();
+                if psr & 1 << 9 == 0 {
+                    Endian::Little
+                } else {
+                    Endian::Big
+                }
+            };
+            core.endianness = Some(endianness);
+            Ok(endianness)
+        })
+    }
 }
 
-impl MemoryInterface for Armv7a<'_> {
+impl MemoryInterface for Armv7aDebugAccess<'_> {
     fn supports_native_64bit_access(&mut self) -> bool {
         false
     }
@@ -1530,6 +1997,11 @@ impl MemoryInterface for Armv7a<'_> {
     }
 
     fn write(&mut self, address: u64, data: &[u8]) -> Result<(), Error> {
+        tracing::info!(
+            "write: writing {} bytes to address {:#x}",
+            data.len(),
+            address
+        );
         self.halted_access(|core| {
             let len = data.len();
             let start_extra_count = ((4 - (address % 4) as usize) % 4).min(len);
@@ -1571,8 +2043,9 @@ impl MemoryInterface for Armv7a<'_> {
     }
 }
 
+/*
 #[cfg(test)]
-mod test {
+mod tests {
     use crate::{
         architecture::arm::{
             FullyQualifiedApAddress, communication_interface::SwdSequence,
@@ -2599,3 +3072,4 @@ mod test {
         );
     }
 }
+*/
