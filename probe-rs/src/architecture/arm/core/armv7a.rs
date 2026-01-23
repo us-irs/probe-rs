@@ -417,8 +417,6 @@ impl<'probe> Armv7a<'probe> {
             base_address,
             debug_ap_addr,
             sequence,
-            // TODO: Where is this polled from?
-            false,
         )?;
         drop(debug_ap);
 
@@ -428,21 +426,6 @@ impl<'probe> Armv7a<'probe> {
             debug_access,
         };
         Ok(core)
-    }
-
-    fn endianness(&mut self) -> Result<Endian, Error> {
-        let mut debug_ap = self
-            .debug_interface
-            .memory_interface(&self.debug_access.debug_ap_addr)?;
-        self.debug_access.endianness(&mut debug_ap)
-    }
-
-    fn fpu_support(&mut self) -> Result<bool, Error> {
-        Ok(self.debug_access.state.fp_reg_count != 0)
-    }
-
-    fn floating_point_register_count(&mut self) -> Result<usize, Error> {
-        Ok(self.debug_access.state.fp_reg_count)
     }
 }
 
@@ -687,6 +670,7 @@ impl MemoryInterface for Armv7a<'_> {
     }
 }
 
+/// Debug access to a ARMv7A core.
 pub struct Armv7aDebugAccess<'probe> {
     debug_ap_addr: FullyQualifiedApAddress,
     state: &'probe mut CortexAState,
@@ -695,20 +679,21 @@ pub struct Armv7aDebugAccess<'probe> {
     endianness: Option<Endian>,
     itr_enabled: bool,
     num_breakpoints: Option<u32>,
-    is_64_bit: bool,
 }
 
 impl<'probe> Armv7aDebugAccess<'probe> {
+    /// Debug access to a ARMv7A core.
+    ///
+    /// This helper structure uses the debug infrastructure of the ARMv7A core for all its
+    /// operations.
     pub fn new(
         memory: &mut Box<dyn ArmMemoryInterface + '_>,
         state: &'probe mut CortexAState,
         base_address: u64,
         debug_ap_addr: FullyQualifiedApAddress,
         sequence: Arc<dyn ArmDebugSequence>,
-        is_64_bit: bool,
     ) -> Result<Self, Error> {
         let mut debug_ap = Self {
-            //debug_interface,
             state,
             base_address,
             debug_ap_addr,
@@ -716,7 +701,6 @@ impl<'probe> Armv7aDebugAccess<'probe> {
             endianness: None,
             itr_enabled: false,
             num_breakpoints: None,
-            is_64_bit,
         };
         if !debug_ap.state.initialized() {
             // determine current state
@@ -781,9 +765,9 @@ impl Armv7aDebugAccess<'_> {
         let ap = memory.fully_qualified_address();
         let interface = memory.get_arm_debug_interface()?;
 
-        if self.is_64_bit {
-            interface.write_raw_ap_register(&ap, TAR2::ADDRESS, (address >> 32) as u32)?;
-        }
+        //if self.is_64_bit {
+            //interface.write_raw_ap_register(&ap, TAR2::ADDRESS, (address >> 32) as u32)?;
+        //}
         interface.write_raw_ap_register(&ap, TAR::ADDRESS, address as u32)?;
 
         Ok(BankedAccess {
