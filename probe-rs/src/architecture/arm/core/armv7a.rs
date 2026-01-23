@@ -2077,15 +2077,14 @@ impl Armv7aDebugAccess<'_> {
     }
 }
 
-/*
 #[cfg(test)]
 mod tests {
     use crate::{
         architecture::arm::{
-            FullyQualifiedApAddress, communication_interface::SwdSequence,
+            FullyQualifiedApAddress, SwoAccess, communication_interface::SwdSequence,
             sequences::DefaultArmSequence,
         },
-        probe::DebugProbeError,
+        probe::{DebugProbe, DebugProbeError},
     };
 
     use super::*;
@@ -2096,20 +2095,194 @@ mod tests {
         ((address - TEST_BASE_ADDRESS) / 4) as u32
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
+    pub struct MockProbe {}
+
+    impl DebugProbe for MockProbe {
+        fn get_name(&self) -> &str {
+            "test"
+        }
+
+        fn speed_khz(&self) -> u32 {
+            0
+        }
+
+        fn set_speed(&mut self, speed_khz: u32) -> Result<u32, DebugProbeError> {
+            Ok(0)
+        }
+
+        fn attach(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn detach(&mut self) -> Result<(), crate::Error> {
+            Ok(())
+        }
+
+        fn target_reset(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn target_reset_deassert(&mut self) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn select_protocol(
+            &mut self,
+            protocol: crate::probe::WireProtocol,
+        ) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+
+        fn active_protocol(&self) -> Option<crate::probe::WireProtocol> {
+            None
+        }
+
+        fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
+            self
+        }
+    }
+
+    pub struct MockDebugInterface {
+        pub memory: MockMemory,
+    }
+
+    impl MockDebugInterface {
+        pub fn new(memory: MockMemory) -> Self {
+            Self { memory }
+        }
+    }
+
+    impl ArmDebugInterface for MockDebugInterface {
+        fn reinitialize(&mut self) -> Result<(), ArmError> {
+            Ok(())
+        }
+
+        fn access_ports(
+            &mut self,
+            _dp: crate::architecture::arm::dp::DpAddress,
+        ) -> Result<std::collections::BTreeSet<FullyQualifiedApAddress>, ArmError> {
+            Ok(std::collections::BTreeSet::new())
+        }
+
+        fn close(self: Box<Self>) -> crate::probe::Probe {
+            crate::probe::Probe::new(MockProbe {})
+        }
+
+        fn select_debug_port(
+            &mut self,
+            _dp: crate::architecture::arm::dp::DpAddress,
+        ) -> Result<(), ArmError> {
+            Ok(())
+        }
+
+        fn current_debug_port(&self) -> Option<crate::architecture::arm::dp::DpAddress> {
+            None
+        }
+
+        fn memory_interface(
+            &mut self,
+            _access_port: &FullyQualifiedApAddress,
+        ) -> Result<Box<dyn ArmMemoryInterface + '_>, ArmError> {
+            Ok(Box::new(self.memory.clone()))
+        }
+    }
+
+    impl DapAccess for MockDebugInterface {
+        fn read_raw_dp_register(
+            &mut self,
+            dp: crate::architecture::arm::dp::DpAddress,
+            addr: crate::architecture::arm::dp::DpRegisterAddress,
+        ) -> Result<u32, ArmError> {
+            Ok(0)
+        }
+
+        fn write_raw_dp_register(
+            &mut self,
+            dp: crate::architecture::arm::dp::DpAddress,
+            addr: crate::architecture::arm::dp::DpRegisterAddress,
+            value: u32,
+        ) -> Result<(), ArmError> {
+            Ok(())
+        }
+
+        fn read_raw_ap_register(
+            &mut self,
+            ap: &FullyQualifiedApAddress,
+            addr: u64,
+        ) -> Result<u32, ArmError> {
+            Ok(0)
+        }
+
+        fn write_raw_ap_register(
+            &mut self,
+            ap: &FullyQualifiedApAddress,
+            addr: u64,
+            value: u32,
+        ) -> Result<(), ArmError> {
+            Ok(())
+        }
+
+        fn try_dap_probe(&self) -> Option<&dyn crate::architecture::arm::DapProbe> {
+            None
+        }
+
+        fn try_dap_probe_mut(&mut self) -> Option<&mut dyn crate::architecture::arm::DapProbe> {
+            None
+        }
+    }
+
+    impl SwdSequence for MockDebugInterface {
+        fn swj_sequence(&mut self, _bit_len: u8, _bits: u64) -> Result<(), DebugProbeError> {
+            Ok(())
+        }
+        /// Corresponds to the DAP_SWJ_Pins function from the ARM Debug sequences
+        fn swj_pins(
+            &mut self,
+            pin_out: u32,
+            pin_select: u32,
+            pin_wait: u32,
+        ) -> Result<u32, DebugProbeError> {
+            Ok(0)
+        }
+    }
+
+    impl SwoAccess for MockDebugInterface {
+        fn enable_swo(
+            &mut self,
+            _config: &crate::architecture::arm::SwoConfig,
+        ) -> Result<(), ArmError> {
+            Ok(())
+        }
+
+        fn disable_swo(&mut self) -> Result<(), ArmError> {
+            Ok(())
+        }
+
+        fn read_swo_timeout(&mut self, _timeout: Duration) -> Result<Vec<u8>, ArmError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[derive(Debug, Copy, Clone)]
     pub struct ExpectedMemoryOp {
         read: bool,
         address: u64,
         value: u32,
     }
 
-    pub struct MockProbe {
+    #[derive(Clone)]
+    pub struct MockMemory {
         expected_ops: Vec<ExpectedMemoryOp>,
     }
 
-    impl MockProbe {
+    impl MockMemory {
         pub fn new() -> Self {
-            MockProbe {
+            MockMemory {
                 expected_ops: vec![],
             }
         }
@@ -2131,7 +2304,7 @@ mod tests {
         }
     }
 
-    impl MemoryInterface<ArmError> for MockProbe {
+    impl MemoryInterface<ArmError> for MockMemory {
         fn read_8(&mut self, _address: u64, _data: &mut [u8]) -> Result<(), ArmError> {
             todo!()
         }
@@ -2242,7 +2415,7 @@ mod tests {
         }
     }
 
-    impl ArmMemoryInterface for MockProbe {
+    impl ArmMemoryInterface for MockMemory {
         fn fully_qualified_address(&self) -> FullyQualifiedApAddress {
             todo!()
         }
@@ -2266,7 +2439,7 @@ mod tests {
         }
     }
 
-    impl SwdSequence for MockProbe {
+    impl SwdSequence for MockMemory {
         fn swj_sequence(&mut self, _bit_len: u8, _bits: u64) -> Result<(), DebugProbeError> {
             todo!()
         }
@@ -2281,7 +2454,7 @@ mod tests {
         }
     }
 
-    fn add_status_expectations(probe: &mut MockProbe, halted: bool) {
+    fn add_status_expectations(probe: &mut MockMemory, halted: bool) {
         let mut dbgdscr = Dbgdscr(0);
         dbgdscr.set_halted(halted);
         dbgdscr.set_restarted(true);
@@ -2291,7 +2464,7 @@ mod tests {
         );
     }
 
-    fn add_enable_itr_expectations(probe: &mut MockProbe) {
+    fn add_enable_itr_expectations(probe: &mut MockMemory) {
         let mut dbgdscr = Dbgdscr(0);
         dbgdscr.set_halted(true);
         probe.expected_read(
@@ -2305,7 +2478,7 @@ mod tests {
         );
     }
 
-    fn add_read_reg_expectations(probe: &mut MockProbe, reg: u16, value: u32) {
+    fn add_read_reg_expectations(probe: &mut MockMemory, reg: u16, value: u32) {
         probe.expected_write(
             Dbgitr::get_mmio_address_from_base(TEST_BASE_ADDRESS).unwrap(),
             build_mcr(14, 0, reg, 0, 5, 0),
@@ -2324,7 +2497,7 @@ mod tests {
         );
     }
 
-    fn add_read_pc_expectations(probe: &mut MockProbe, value: u32) {
+    fn add_read_pc_expectations(probe: &mut MockMemory, value: u32) {
         let mut dbgdscr = Dbgdscr(0);
         dbgdscr.set_instrcoml_l(true);
         dbgdscr.set_txfull_l(true);
@@ -2341,7 +2514,7 @@ mod tests {
         add_read_reg_expectations(probe, 0, value + 8);
     }
 
-    fn add_read_fp_count_expectations(probe: &mut MockProbe) {
+    fn add_read_fp_count_expectations(probe: &mut MockMemory) {
         let mut dbgdscr = Dbgdscr(0);
         dbgdscr.set_instrcoml_l(true);
         dbgdscr.set_txfull_l(true);
@@ -2373,7 +2546,7 @@ mod tests {
         add_read_reg_expectations(probe, 0, 0b010);
     }
 
-    fn add_read_cpsr_expectations(probe: &mut MockProbe, value: u32) {
+    fn add_read_cpsr_expectations(probe: &mut MockMemory, value: u32) {
         let mut dbgdscr = Dbgdscr(0);
         dbgdscr.set_instrcoml_l(true);
         dbgdscr.set_txfull_l(true);
@@ -2389,7 +2562,7 @@ mod tests {
         add_read_reg_expectations(probe, 0, value);
     }
 
-    fn add_idr_expectations(probe: &mut MockProbe, bp_count: u32) {
+    fn add_idr_expectations(probe: &mut MockMemory, bp_count: u32) {
         let mut dbgdidr = Dbgdidr(0);
         dbgdidr.set_brps(bp_count - 1);
         probe.expected_read(
@@ -2398,7 +2571,7 @@ mod tests {
         );
     }
 
-    fn add_set_r0_expectation(probe: &mut MockProbe, value: u32) {
+    fn add_set_r0_expectation(probe: &mut MockMemory, value: u32) {
         let mut dbgdscr = Dbgdscr(0);
         dbgdscr.set_instrcoml_l(true);
         dbgdscr.set_rxfull_l(true);
@@ -2422,7 +2595,7 @@ mod tests {
         );
     }
 
-    fn add_read_memory_expectations(probe: &mut MockProbe, address: u64, value: u32) {
+    fn add_read_memory_expectations(probe: &mut MockMemory, address: u64, value: u32) {
         add_set_r0_expectation(probe, address as u32);
 
         let mut dbgdscr = Dbgdscr(0);
@@ -2443,7 +2616,7 @@ mod tests {
         );
     }
 
-    impl Drop for MockProbe {
+    impl Drop for MockMemory {
         fn drop(&mut self) {
             if !self.expected_ops.is_empty() {
                 panic!("self.expected_ops is not empty: {:?}", self.expected_ops);
@@ -2453,18 +2626,20 @@ mod tests {
 
     #[test]
     fn armv7a_new() {
-        let mut probe = MockProbe::new();
-
+        let mut memory = MockMemory::new();
         // Add expectations
-        add_status_expectations(&mut probe, true);
-        add_enable_itr_expectations(&mut probe);
-        add_read_reg_expectations(&mut probe, 0, 0);
-        add_read_fp_count_expectations(&mut probe);
+        add_status_expectations(&mut memory, true);
+        add_enable_itr_expectations(&mut memory);
+        add_read_reg_expectations(&mut memory, 0, 0);
+        add_read_fp_count_expectations(&mut memory);
 
-        let mock_mem = Box::new(probe) as _;
+        let mut mock_if = Box::new(MockDebugInterface::new(memory)) as _;
+        let debug_ap = FullyQualifiedApAddress::v1_with_default_dp(0);
 
         let _ = Armv7a::new(
-            mock_mem,
+            &mut mock_if,
+            debug_ap,
+            None,
             &mut CortexAState::new(),
             TEST_BASE_ADDRESS,
             DefaultArmSequence::create(),
@@ -2474,32 +2649,36 @@ mod tests {
 
     #[test]
     fn armv7a_core_halted() {
-        let mut probe = MockProbe::new();
-        let mut state = CortexAState::new();
+        let mut memory = MockMemory::new();
 
         // Add expectations
-        add_status_expectations(&mut probe, true);
-        add_enable_itr_expectations(&mut probe);
-        add_read_reg_expectations(&mut probe, 0, 0);
-        add_read_fp_count_expectations(&mut probe);
+        add_status_expectations(&mut memory, true);
+        add_enable_itr_expectations(&mut memory);
+        add_read_reg_expectations(&mut memory, 0, 0);
+        add_read_fp_count_expectations(&mut memory);
+
+        let mut state = CortexAState::new();
+        let mut mock_if = Box::new(MockDebugInterface::new(memory));
+        let debug_ap = FullyQualifiedApAddress::v1_with_default_dp(0);
 
         let mut dbgdscr = Dbgdscr(0);
         dbgdscr.set_halted(false);
-        probe.expected_read(
+        mock_if.memory.expected_read(
             Dbgdscr::get_mmio_address_from_base(TEST_BASE_ADDRESS).unwrap(),
             dbgdscr.into(),
         );
 
         dbgdscr.set_halted(true);
-        probe.expected_read(
+        mock_if.memory.expected_read(
             Dbgdscr::get_mmio_address_from_base(TEST_BASE_ADDRESS).unwrap(),
             dbgdscr.into(),
         );
 
-        let mock_mem = Box::new(probe) as _;
-
+        let mut mock_if = mock_if as _;
         let mut armv7a = Armv7a::new(
-            mock_mem,
+            &mut mock_if,
+            debug_ap,
+            None,
             &mut state,
             TEST_BASE_ADDRESS,
             DefaultArmSequence::create(),
@@ -2513,32 +2692,35 @@ mod tests {
 
     #[test]
     fn armv7a_wait_for_core_halted() {
-        let mut probe = MockProbe::new();
-        let mut state = CortexAState::new();
+        let mut memory = MockMemory::new();
 
         // Add expectations
-        add_status_expectations(&mut probe, true);
-        add_enable_itr_expectations(&mut probe);
-        add_read_reg_expectations(&mut probe, 0, 0);
-        add_read_fp_count_expectations(&mut probe);
+        add_status_expectations(&mut memory, true);
+        add_enable_itr_expectations(&mut memory);
+        add_read_reg_expectations(&mut memory, 0, 0);
+        add_read_fp_count_expectations(&mut memory);
 
         let mut dbgdscr = Dbgdscr(0);
         dbgdscr.set_halted(false);
-        probe.expected_read(
+        memory.expected_read(
             Dbgdscr::get_mmio_address_from_base(TEST_BASE_ADDRESS).unwrap(),
             dbgdscr.into(),
         );
 
         dbgdscr.set_halted(true);
-        probe.expected_read(
+        memory.expected_read(
             Dbgdscr::get_mmio_address_from_base(TEST_BASE_ADDRESS).unwrap(),
             dbgdscr.into(),
         );
+        let mut state = CortexAState::new();
 
-        let mock_mem = Box::new(probe) as _;
+        let mut mock_if = Box::new(MockDebugInterface::new(memory)) as _;
+        let debug_ap = FullyQualifiedApAddress::v1_with_default_dp(0);
 
         let mut armv7a = Armv7a::new(
-            mock_mem,
+            &mut mock_if,
+            debug_ap,
+            None,
             &mut state,
             TEST_BASE_ADDRESS,
             DefaultArmSequence::create(),
@@ -2553,26 +2735,29 @@ mod tests {
 
     #[test]
     fn armv7a_status_running() {
-        let mut probe = MockProbe::new();
+        let mut memory = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
-        add_status_expectations(&mut probe, true);
-        add_enable_itr_expectations(&mut probe);
-        add_read_reg_expectations(&mut probe, 0, 0);
-        add_read_fp_count_expectations(&mut probe);
+        add_status_expectations(&mut memory, true);
+        add_enable_itr_expectations(&mut memory);
+        add_read_reg_expectations(&mut memory, 0, 0);
+        add_read_fp_count_expectations(&mut memory);
 
         let mut dbgdscr = Dbgdscr(0);
         dbgdscr.set_halted(false);
-        probe.expected_read(
+        memory.expected_read(
             Dbgdscr::get_mmio_address_from_base(TEST_BASE_ADDRESS).unwrap(),
             dbgdscr.into(),
         );
 
-        let mock_mem = Box::new(probe) as _;
+        let mut mock_if = Box::new(MockDebugInterface::new(memory)) as _;
+        let debug_ap = FullyQualifiedApAddress::v1_with_default_dp(0);
 
         let mut armv7a = Armv7a::new(
-            mock_mem,
+            &mut mock_if,
+            debug_ap,
+            None,
             &mut state,
             TEST_BASE_ADDRESS,
             DefaultArmSequence::create(),
@@ -2585,26 +2770,29 @@ mod tests {
 
     #[test]
     fn armv7a_status_halted() {
-        let mut probe = MockProbe::new();
+        let mut memory = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
-        add_status_expectations(&mut probe, true);
-        add_enable_itr_expectations(&mut probe);
-        add_read_reg_expectations(&mut probe, 0, 0);
-        add_read_fp_count_expectations(&mut probe);
+        add_status_expectations(&mut memory, true);
+        add_enable_itr_expectations(&mut memory);
+        add_read_reg_expectations(&mut memory, 0, 0);
+        add_read_fp_count_expectations(&mut memory);
 
         let mut dbgdscr = Dbgdscr(0);
         dbgdscr.set_halted(true);
-        probe.expected_read(
+        memory.expected_read(
             Dbgdscr::get_mmio_address_from_base(TEST_BASE_ADDRESS).unwrap(),
             dbgdscr.into(),
         );
 
-        let mock_mem = Box::new(probe) as _;
+        let mut mock_if = Box::new(MockDebugInterface::new(memory)) as _;
+        let debug_ap = FullyQualifiedApAddress::v1_with_default_dp(0);
 
         let mut armv7a = Armv7a::new(
-            mock_mem,
+            &mut mock_if,
+            debug_ap,
+            None,
             &mut state,
             TEST_BASE_ADDRESS,
             DefaultArmSequence::create(),
@@ -2622,7 +2810,7 @@ mod tests {
     fn armv7a_read_core_reg_common() {
         const REG_VALUE: u32 = 0xABCD;
 
-        let mut probe = MockProbe::new();
+        let mut probe = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
@@ -2661,7 +2849,7 @@ mod tests {
     fn armv7a_read_core_reg_pc() {
         const REG_VALUE: u32 = 0xABCD;
 
-        let mut probe = MockProbe::new();
+        let mut probe = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
@@ -2700,7 +2888,7 @@ mod tests {
     fn armv7a_read_core_reg_cpsr() {
         const REG_VALUE: u32 = 0xABCD;
 
-        let mut probe = MockProbe::new();
+        let mut probe = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
@@ -2739,7 +2927,7 @@ mod tests {
     fn armv7a_halt() {
         const REG_VALUE: u32 = 0xABCD;
 
-        let mut probe = MockProbe::new();
+        let mut probe = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
@@ -2784,7 +2972,7 @@ mod tests {
 
     #[test]
     fn armv7a_run() {
-        let mut probe = MockProbe::new();
+        let mut probe = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
@@ -2839,7 +3027,7 @@ mod tests {
     #[test]
     fn armv7a_available_breakpoint_units() {
         const BP_COUNT: u32 = 4;
-        let mut probe = MockProbe::new();
+        let mut probe = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
@@ -2869,7 +3057,7 @@ mod tests {
         const BP_COUNT: u32 = 4;
         const BP1: u64 = 0x2345;
         const BP2: u64 = 0x8000_0000;
-        let mut probe = MockProbe::new();
+        let mut probe = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
@@ -2938,7 +3126,7 @@ mod tests {
     #[test]
     fn armv7a_set_hw_breakpoint() {
         const BP_VALUE: u64 = 0x2345;
-        let mut probe = MockProbe::new();
+        let mut probe = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
@@ -2981,7 +3169,7 @@ mod tests {
 
     #[test]
     fn armv7a_clear_hw_breakpoint() {
-        let mut probe = MockProbe::new();
+        let mut probe = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
@@ -3018,7 +3206,7 @@ mod tests {
         const MEMORY_VALUE: u32 = 0xBA5EBA11;
         const MEMORY_ADDRESS: u64 = 0x12345678;
 
-        let mut probe = MockProbe::new();
+        let mut probe = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
@@ -3044,7 +3232,7 @@ mod tests {
     }
 
     fn test_read_word(value: u32, address: u64, memory_word_address: u64, endian: Endian) -> u8 {
-        let mut probe = MockProbe::new();
+        let mut probe = MockMemory::new();
         let mut state = CortexAState::new();
 
         // Add expectations
@@ -3106,4 +3294,3 @@ mod tests {
         );
     }
 }
-*/
