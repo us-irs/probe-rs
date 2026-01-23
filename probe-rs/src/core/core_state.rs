@@ -71,7 +71,7 @@ impl CombinedCoreState {
                 crate::architecture::arm::armv7a::Armv7a::new(
                     arm_interface,
                     arm_debug_ap,
-                    arm_memory_ap.unwrap(),
+                    arm_memory_ap,
                     s,
                     options.debug_base.expect("base_address not specified"),
                     debug_sequence,
