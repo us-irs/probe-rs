@@ -614,10 +614,25 @@ impl MemoryInterface for Armv7a<'_> {
         self.debug_access.supports_native_64bit_access()
     }
 
+    fn read_word_8(&mut self, address: u64) -> Result<u8, Error> {
+        match &self.mem_ap_addr {
+            Some(mem_ap_addr) => {
+                let mut memory_ap = self.debug_interface.memory_interface(mem_ap_addr)?;
+                memory_ap.read_word_8(address).map_err(Error::Arm)
+            }
+            None => {
+                let mut debug_ap = self
+                    .debug_interface
+                    .memory_interface(&self.debug_access.debug_ap_addr)?;
+                self.debug_access.read_word_8(&mut debug_ap, address)
+            }
+        }
+    }
+
     fn read_64(&mut self, address: u64, data: &mut [u64]) -> Result<(), Error> {
         match &self.mem_ap_addr {
             Some(mem_ap_addr) => {
-                let mut memory_ap = self.debug_interface.memory_interface(&mem_ap_addr)?;
+                let mut memory_ap = self.debug_interface.memory_interface(mem_ap_addr)?;
                 memory_ap.read_64(address, data).map_err(Error::Arm)
             }
             None => {
@@ -632,7 +647,7 @@ impl MemoryInterface for Armv7a<'_> {
     fn read_32(&mut self, address: u64, data: &mut [u32]) -> Result<(), Error> {
         match &self.mem_ap_addr {
             Some(mem_ap_addr) => {
-                let mut memory_ap = self.debug_interface.memory_interface(&mem_ap_addr)?;
+                let mut memory_ap = self.debug_interface.memory_interface(mem_ap_addr)?;
                 memory_ap.read_32(address, data).map_err(Error::Arm)
             }
             None => {
@@ -647,7 +662,7 @@ impl MemoryInterface for Armv7a<'_> {
     fn read_16(&mut self, address: u64, data: &mut [u16]) -> Result<(), Error> {
         match &self.mem_ap_addr {
             Some(mem_ap_addr) => {
-                let mut memory_ap = self.debug_interface.memory_interface(&mem_ap_addr)?;
+                let mut memory_ap = self.debug_interface.memory_interface(mem_ap_addr)?;
                 memory_ap.read_16(address, data).map_err(Error::Arm)
             }
             None => {
@@ -662,7 +677,7 @@ impl MemoryInterface for Armv7a<'_> {
     fn read_8(&mut self, address: u64, data: &mut [u8]) -> Result<(), Error> {
         match &self.mem_ap_addr {
             Some(mem_ap_addr) => {
-                let mut memory_ap = self.debug_interface.memory_interface(&mem_ap_addr)?;
+                let mut memory_ap = self.debug_interface.memory_interface(mem_ap_addr)?;
                 memory_ap.read_8(address, data).map_err(Error::Arm)
             }
             None => {
@@ -677,7 +692,7 @@ impl MemoryInterface for Armv7a<'_> {
     fn write_64(&mut self, address: u64, data: &[u64]) -> Result<(), Error> {
         match &self.mem_ap_addr {
             Some(mem_ap_addr) => {
-                let mut memory_ap = self.debug_interface.memory_interface(&mem_ap_addr)?;
+                let mut memory_ap = self.debug_interface.memory_interface(mem_ap_addr)?;
                 memory_ap.write_64(address, data).map_err(Error::Arm)
             }
             None => {
@@ -692,7 +707,7 @@ impl MemoryInterface for Armv7a<'_> {
     fn write_32(&mut self, address: u64, data: &[u32]) -> Result<(), Error> {
         match &self.mem_ap_addr {
             Some(mem_ap_addr) => {
-                let mut memory_ap = self.debug_interface.memory_interface(&mem_ap_addr)?;
+                let mut memory_ap = self.debug_interface.memory_interface(mem_ap_addr)?;
                 memory_ap.write_32(address, data).map_err(Error::Arm)
             }
             None => {
@@ -707,7 +722,7 @@ impl MemoryInterface for Armv7a<'_> {
     fn write_16(&mut self, address: u64, data: &[u16]) -> Result<(), Error> {
         match &self.mem_ap_addr {
             Some(mem_ap_addr) => {
-                let mut memory_ap = self.debug_interface.memory_interface(&mem_ap_addr)?;
+                let mut memory_ap = self.debug_interface.memory_interface(mem_ap_addr)?;
                 memory_ap.write_16(address, data).map_err(Error::Arm)
             }
             None => {
@@ -722,7 +737,7 @@ impl MemoryInterface for Armv7a<'_> {
     fn write_8(&mut self, address: u64, data: &[u8]) -> Result<(), Error> {
         match &self.mem_ap_addr {
             Some(mem_ap_addr) => {
-                let mut memory_ap = self.debug_interface.memory_interface(&mem_ap_addr)?;
+                let mut memory_ap = self.debug_interface.memory_interface(mem_ap_addr)?;
                 memory_ap.write_8(address, data).map_err(Error::Arm)
             }
             None => {
@@ -1526,43 +1541,6 @@ impl Armv7aDebugAccess<'_> {
         &PC
     }
 
-    fn frame_pointer(&self) -> &'static CoreRegister {
-        &FP
-    }
-
-    fn stack_pointer(&self) -> &'static CoreRegister {
-        &SP
-    }
-
-    fn return_address(&self) -> &'static CoreRegister {
-        &RA
-    }
-
-    fn hw_breakpoints_enabled(&self) -> bool {
-        true
-    }
-
-    fn architecture(&self) -> Architecture {
-        Architecture::Arm
-    }
-
-    fn core_type(&self) -> CoreType {
-        CoreType::Armv7a
-    }
-
-    fn instruction_set(
-        &mut self,
-        memory: &mut Box<dyn ArmMemoryInterface>,
-    ) -> Result<InstructionSet, Error> {
-        let cpsr: u32 = self.read_core_reg(memory, XPSR.id())?.try_into()?;
-
-        // CPSR bit 5 - T - Thumb mode
-        match (cpsr >> 5) & 1 {
-            1 => Ok(InstructionSet::Thumb2),
-            _ => Ok(InstructionSet::A32),
-        }
-    }
-
     #[tracing::instrument(skip(self, memory))]
     fn reset_catch_set(
         &mut self,
@@ -1613,9 +1591,10 @@ impl Armv7aDebugAccess<'_> {
         Ok(())
     }
 
+    /// Find endianness of the system by polling the XPSR register.
     pub fn find_endianness(
         &mut self,
-        memory: &mut Box<dyn ArmMemoryInterface>,
+        memory: &mut Box<dyn ArmMemoryInterface + '_>,
     ) -> Result<Endian, Error> {
         self.halted_access(memory, |core, memory| {
             let endianness = {
@@ -1709,7 +1688,6 @@ impl Armv7aDebugAccess<'_> {
 
     fn read_word_8(
         &mut self,
-
         memory: &mut Box<dyn ArmMemoryInterface + '_>,
         address: u64,
     ) -> Result<u8, Error> {
