@@ -720,9 +720,7 @@ impl<'probe> Armv7aDebugAccess<'probe> {
             };
 
             debug_ap.state.current_state = core_state;
-        }
 
-        if !debug_ap.state.initialized() {
             debug_ap.reset_register_cache();
             debug_ap.read_fp_reg_count(memory)?;
             debug_ap.state.initialize();
