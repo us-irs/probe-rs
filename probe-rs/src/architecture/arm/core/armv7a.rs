@@ -705,9 +705,10 @@ impl<'probe> Armv7aDebugAccess<'probe> {
         if !debug_ap.state.initialized() {
             // determine current state
             let address = Dbgdscr::get_mmio_address_from_base(base_address)?;
-            let dbgdscr = Dbgdscr(debug_ap.read_word_32(memory, address)?);
+            let dbgdscr = Dbgdscr(memory.read_word_32(address)?);
 
             tracing::debug!("State when connecting: {:x?}", dbgdscr);
+            println!("State when connecting: {:x?}", dbgdscr);
 
             let core_state = if dbgdscr.halted() {
                 let reason = dbgdscr.halt_reason();
