@@ -782,7 +782,6 @@ impl<'probe> Armv7aDebugAccess<'probe> {
             let dbgdscr = Dbgdscr(memory.read_word_32(address)?);
 
             tracing::debug!("State when connecting: {:x?}", dbgdscr);
-            println!("State when connecting: {:x?}", dbgdscr);
 
             let core_state = if dbgdscr.halted() {
                 let reason = dbgdscr.halt_reason();
