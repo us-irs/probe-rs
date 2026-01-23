@@ -42,8 +42,6 @@ impl CombinedCoreState {
     ) -> Result<Core<'probe>, Error> {
         let name = &target.cores[self.id].name;
 
-        let memory = arm_interface.memory_interface(&self.arm_memory_ap())?;
-
         let ResolvedCoreOptions::Arm { options, sequence } = &self.core_state.core_access_options
         else {
             unreachable!(
@@ -53,48 +51,65 @@ impl CombinedCoreState {
         };
         let debug_sequence = sequence.clone();
 
+        let arm_debug_ap = self.arm_debug_ap();
+        let arm_memory_ap = self.arm_memory_ap();
+
         Ok(match &mut self.specific_state {
-            SpecificCoreState::Armv6m(s) => Core::new(
-                self.id,
-                name,
-                target,
-                crate::architecture::arm::armv6m::Armv6m::new(memory, s, debug_sequence)?,
-            ),
+            SpecificCoreState::Armv6m(s) => {
+                let memory = arm_interface.memory_interface(&arm_debug_ap)?;
+                Core::new(
+                    self.id,
+                    name,
+                    target,
+                    crate::architecture::arm::armv6m::Armv6m::new(memory, s, debug_sequence)?,
+                )
+            }
             SpecificCoreState::Armv7a(s) => Core::new(
                 self.id,
                 name,
                 target,
                 crate::architecture::arm::armv7a::Armv7a::new(
-                    memory,
+                    arm_interface,
+                    arm_debug_ap,
+                    arm_memory_ap.unwrap(),
                     s,
                     options.debug_base.expect("base_address not specified"),
                     debug_sequence,
                 )?,
             ),
-            SpecificCoreState::Armv7m(s) | SpecificCoreState::Armv7em(s) => Core::new(
-                self.id,
-                name,
-                target,
-                crate::architecture::arm::armv7m::Armv7m::new(memory, s, debug_sequence)?,
-            ),
-            SpecificCoreState::Armv8a(s) => Core::new(
-                self.id,
-                name,
-                target,
-                crate::architecture::arm::armv8a::Armv8a::new(
-                    memory,
-                    s,
-                    options.debug_base.expect("base_address not specified"),
-                    options.cti_base.expect("cti_address not specified"),
-                    debug_sequence,
-                )?,
-            ),
-            SpecificCoreState::Armv8m(s) => Core::new(
-                self.id,
-                name,
-                target,
-                crate::architecture::arm::armv8m::Armv8m::new(memory, s, debug_sequence)?,
-            ),
+            SpecificCoreState::Armv7m(s) | SpecificCoreState::Armv7em(s) => {
+                let memory = arm_interface.memory_interface(&arm_debug_ap)?;
+                Core::new(
+                    self.id,
+                    name,
+                    target,
+                    crate::architecture::arm::armv7m::Armv7m::new(memory, s, debug_sequence)?,
+                )
+            }
+            SpecificCoreState::Armv8a(s) => {
+                let memory = arm_interface.memory_interface(&arm_debug_ap)?;
+                Core::new(
+                    self.id,
+                    name,
+                    target,
+                    crate::architecture::arm::armv8a::Armv8a::new(
+                        memory,
+                        s,
+                        options.debug_base.expect("base_address not specified"),
+                        options.cti_base.expect("cti_address not specified"),
+                        debug_sequence,
+                    )?,
+                )
+            }
+            SpecificCoreState::Armv8m(s) => {
+                let memory = arm_interface.memory_interface(&arm_debug_ap)?;
+                Core::new(
+                    self.id,
+                    name,
+                    target,
+                    crate::architecture::arm::armv8m::Armv8m::new(memory, s, debug_sequence)?,
+                )
+            }
             _ => {
                 unreachable!(
                     "The stored core state is not compatible with the ARM architecture. \
@@ -120,7 +135,7 @@ impl CombinedCoreState {
             // Enable debug mode
             sequence.debug_core_start(
                 interface,
-                &self.arm_memory_ap(),
+                &self.arm_debug_ap(),
                 self.core_type(),
                 options.debug_base,
                 options.cti_base,
@@ -142,7 +157,7 @@ impl CombinedCoreState {
             );
         };
 
-        let mut memory_interface = interface.memory_interface(&self.arm_memory_ap())?;
+        let mut memory_interface = interface.memory_interface(&self.arm_debug_ap())?;
 
         let reset_catch_span = tracing::debug_span!("reset_catch_set", id = self.id()).entered();
         sequence.reset_catch_set(&mut *memory_interface, self.core_type(), options.debug_base)?;
@@ -217,13 +232,21 @@ impl CombinedCoreState {
         ))
     }
 
-    /// Get the memory AP for this core.
+    /// Get the primary AP for this core which can be used for debug access.
+    /// Most ARM architectures also use this AP for memory access.
     ///
     /// ## Panic
     ///
     /// This function will panic if the core is not an ARM core and doesn't have a memory AP
-    pub(crate) fn arm_memory_ap(&self) -> FullyQualifiedApAddress {
-        self.core_state.memory_ap()
+    pub(crate) fn arm_debug_ap(&self) -> FullyQualifiedApAddress {
+        self.core_state.ap()
+    }
+
+    /// Get the memory AP for this core.
+    ///
+    /// Some architectures have a separate AP for memory access.
+    pub(crate) fn arm_memory_ap(&self) -> Option<FullyQualifiedApAddress> {
+        self.core_state.mem_ap()
     }
 }
 
@@ -242,7 +265,7 @@ impl CoreState {
         }
     }
 
-    pub(crate) fn memory_ap(&self) -> FullyQualifiedApAddress {
+    pub(crate) fn ap(&self) -> FullyQualifiedApAddress {
         let ResolvedCoreOptions::Arm { options, .. } = &self.core_access_options else {
             unreachable!(
                 "The stored core state is not compatible with the ARM architecture. \
@@ -260,6 +283,29 @@ impl CoreState {
                 FullyQualifiedApAddress::v2_with_dp(dp, ApV2Address::new(*ap))
             }
         }
+    }
+
+    pub(crate) fn mem_ap(&self) -> Option<FullyQualifiedApAddress> {
+        let ResolvedCoreOptions::Arm { options, .. } = &self.core_access_options else {
+            unreachable!(
+                "The stored core state is not compatible with the ARM architecture. \
+                This should never happen. Please file a bug if it does."
+            );
+        };
+        if options.mem_ap.is_none() {
+            return None;
+        }
+
+        let dp = match options.targetsel {
+            None => DpAddress::Default,
+            Some(x) => DpAddress::Multidrop(x),
+        };
+        Some(match &options.mem_ap.as_ref().unwrap() {
+            probe_rs_target::ApAddress::V1(ap) => FullyQualifiedApAddress::v1_with_dp(dp, *ap),
+            probe_rs_target::ApAddress::V2(ap) => {
+                FullyQualifiedApAddress::v2_with_dp(dp, ApV2Address::new(*ap))
+            }
+        })
     }
 }
 
