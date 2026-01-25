@@ -711,14 +711,8 @@ impl Session {
         vector_table_addr: u64,
         core_id: usize,
     ) -> Result<(), crate::Error> {
-        match &self.target.debug_sequence.clone() {
-            crate::config::DebugSequence::Arm(arm) => {
-                arm.prepare_running_on_ram(vector_table_addr, self, core_id)
-            }
-            _ => Err(crate::Error::NotImplemented(
-                "ram flash non-ARM architectures",
-            )),
-        }
+        let mut core = self.core(core_id)?;
+        core.prepare_running_on_ram(vector_table_addr)
     }
 
     /// Check if the connected device has a debug erase sequence defined
