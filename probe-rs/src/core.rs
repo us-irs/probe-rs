@@ -550,6 +550,21 @@ impl<'probe> Core<'probe> {
     pub fn spill_registers(&mut self) -> Result<(), Error> {
         self.inner.spill_registers()
     }
+
+    /// This function can be used to set up an application which was flashed to RAM.
+    pub fn prepare_running_on_ram(
+        &mut self,
+        vector_table_addr: u64,
+    ) -> Result<(), crate::Error> {
+        match &self.target.debug_sequence.clone() {
+            crate::config::DebugSequence::Arm(arm) => {
+                arm.prepare_running_on_ram_of_core(vector_table_addr, self)
+            }
+            _ => Err(crate::Error::NotImplemented(
+                "ram flash non-ARM architectures",
+            )),
+        }
+    }
 }
 
 impl CoreInterface for Core<'_> {
