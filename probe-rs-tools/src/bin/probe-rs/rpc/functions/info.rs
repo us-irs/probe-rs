@@ -6,6 +6,7 @@ use anyhow::anyhow;
 use postcard_rpc::header::{VarHeader, VarSeq};
 use postcard_schema::{Schema, schema};
 use probe_rs::{
+    Permissions,
     architecture::{
         arm::{
             self, ApAddress, ApV2Address, ArmDebugInterface,
@@ -42,6 +43,7 @@ pub struct TargetInfoRequest {
     pub speed: Option<u32>,
     pub connect_under_reset: bool,
     pub dry_run: bool,
+    pub chip: Option<String>,
     pub target_sel: Option<u32>,
     pub protocol: WireProtocol,
 }
@@ -75,23 +77,51 @@ pub async fn target_info(
 
     let probe = probe_options.attach_probe(&ctx.lister())?;
 
-    if let Err(e) = try_show_info(
-        ctx,
-        probe,
-        request.protocol,
-        probe_options.connect_under_reset(),
-        request.target_sel,
-    )
-    .await
-    {
-        ctx.publish::<TargetInfoDataTopic>(
-            VarSeq::Seq2(0),
-            &InfoEvent::Message(format!(
-                "Failed to identify target using protocol {}: {e:?}",
-                request.protocol
-            )),
-        )
-        .await?;
+    match request.chip {
+        Some(chip) => {
+            if let Err(e) = try_show_info_with_chip(
+                ctx,
+                probe,
+                &chip,
+                // Right now, core ID is hardcoded to 0, but could be specified as a CLI argument
+                // in the future.
+                Some(0),
+                request.protocol,
+                request.connect_under_reset,
+                request.target_sel,
+            )
+            .await
+            {
+                ctx.publish::<TargetInfoDataTopic>(
+                    VarSeq::Seq2(0),
+                    &InfoEvent::Message(format!(
+                        "Failed to get information for chip {} using protocol {}: {e:?}",
+                        &chip, request.protocol
+                    )),
+                )
+                .await?;
+            }
+        }
+        None => {
+            if let Err(e) = try_show_info(
+                ctx,
+                probe,
+                request.protocol,
+                probe_options.connect_under_reset(),
+                request.target_sel,
+            )
+            .await
+            {
+                ctx.publish::<TargetInfoDataTopic>(
+                    VarSeq::Seq2(0),
+                    &InfoEvent::Message(format!(
+                        "Failed to identify target using protocol {}: {e:?}",
+                        request.protocol
+                    )),
+                )
+                .await?;
+            }
+        }
     }
 
     Ok(())
@@ -283,6 +313,53 @@ impl ComponentTreeNode {
 
     fn push(&mut self, child: impl Into<ComponentTreeNode>) {
         self.children.push(child.into());
+    }
+}
+
+async fn try_show_info_with_chip(
+    ctx: &mut RpcContext,
+    mut probe: Probe,
+    chip: &String,
+    core_id: Option<u32>,
+    protocol: WireProtocol,
+    connect_under_reset: bool,
+    target_sel: Option<u32>,
+) -> anyhow::Result<()> {
+    probe.select_protocol(ProbeRsWireProtocol::from(protocol))?;
+    let mut session = if connect_under_reset {
+        probe.attach_under_reset(chip, Permissions::default())?
+    } else {
+        probe.attach(chip, Permissions::default())?
+    };
+    match session.architecture() {
+        probe_rs::Architecture::Arm => {
+            let dp_addr = if let Some(target_sel) = target_sel {
+                vec![dp::DpAddress::Multidrop(target_sel)]
+            } else if chip == "RP2040" {
+                vec![
+                    dp::DpAddress::Default,
+                    dp::DpAddress::Multidrop(0x01002927),
+                    dp::DpAddress::Multidrop(0x11002927),
+                ]
+            } else {
+                vec![dp::DpAddress::Default]
+            };
+            for address in dp_addr {
+                let interface = session.get_arm_interface()?;
+                show_arm_info(ctx, interface, address).await?;
+            }
+            Ok(())
+        }
+        probe_rs::Architecture::Riscv => {
+            let mut interface = session.get_riscv_interface(core_id.unwrap_or(0) as usize)?;
+            show_riscv_info(ctx, &mut interface).await?;
+            Ok(())
+        }
+        probe_rs::Architecture::Xtensa => {
+            let mut interface = session.get_xtensa_interface(core_id.unwrap_or(0) as usize)?;
+            show_xtensa_info(ctx, &mut interface).await?;
+            Ok(())
+        }
     }
 }
 

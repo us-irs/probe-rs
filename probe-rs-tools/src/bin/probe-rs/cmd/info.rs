@@ -67,6 +67,7 @@ impl Cmd {
                 speed: self.common.speed,
                 connect_under_reset: self.common.connect_under_reset,
                 dry_run: self.common.dry_run,
+                chip: self.common.chip.clone(),
             };
 
             let result = client
