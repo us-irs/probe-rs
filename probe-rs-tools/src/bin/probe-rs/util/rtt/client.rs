@@ -107,7 +107,7 @@ impl RttClient {
             location
         };
 
-        let rtt = match Rtt::attach_at(core, location) {
+        let rtt = match Rtt::attach_at(core, location, None) {
             Ok(rtt) => rtt,
             Err(Error::ControlBlockNotFound) => {
                 self.last_control_block_address = None;

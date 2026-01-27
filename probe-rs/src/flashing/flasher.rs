@@ -1008,6 +1008,7 @@ impl<O: Operation> ActiveFlasher<'_, '_, O> {
                 &mut self.core,
                 Duration::from_secs(1),
                 &ScanRegion::Exact(rtt_address),
+                None,
             ) {
                 Ok(rtt) => self.rtt = Some(rtt),
                 Err(crate::rtt::Error::NoControlBlockLocation) => {}

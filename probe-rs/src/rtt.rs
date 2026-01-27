@@ -50,6 +50,7 @@ pub use channel::*;
 use object::{Object as _, ObjectSymbol as _};
 
 use crate::Session;
+use crate::architecture::arm::FullyQualifiedApAddress;
 use crate::{Core, MemoryInterface, config::MemoryRegion};
 use std::ops::Range;
 use std::thread;
@@ -252,6 +253,7 @@ impl Rtt {
         core: &mut Core,
         // Pointer from which to scan
         ptr: u64,
+        custom_ap: Option<FullyQualifiedApAddress>,
     ) -> Result<Rtt, Error> {
         let is_64_bit = core.is_64_bit();
 
@@ -312,8 +314,13 @@ impl Rtt {
         for (channel_index, buffer) in up_channels_buffer.into_iter().enumerate() {
             let buffer_size = buffer.size() as u64;
 
-            if let Some(chan) = Channel::from(core, channel_index, offset, buffer)? {
-                up_channels.push(UpChannel(chan));
+            if let Some(channel) =
+                Channel::from(core, custom_ap.as_ref(), channel_index, offset, buffer)?
+            {
+                up_channels.push(UpChannel {
+                    channel,
+                    custom_ap: custom_ap.clone(),
+                });
             } else {
                 tracing::warn!("Buffer for up channel {channel_index} not initialized");
             }
@@ -324,8 +331,13 @@ impl Rtt {
         for (channel_index, buffer) in down_channels_buffer.into_iter().enumerate() {
             let buffer_size = buffer.size() as u64;
 
-            if let Some(chan) = Channel::from(core, channel_index, offset, buffer)? {
-                down_channels.push(DownChannel(chan));
+            if let Some(channel) =
+                Channel::from(core, custom_ap.as_ref(), channel_index, offset, buffer)?
+            {
+                down_channels.push(DownChannel {
+                    channel,
+                    custom_ap: custom_ap.clone(),
+                });
             } else {
                 tracing::warn!("Buffer for down channel {channel_index} not initialized");
             }
@@ -341,15 +353,22 @@ impl Rtt {
 
     /// Attempts to detect an RTT control block in the specified RAM region(s) and returns an
     /// instance if a valid control block was found.
-    pub fn attach_region(core: &mut Core, region: &ScanRegion) -> Result<Rtt, Error> {
+    pub fn attach_region(
+        core: &mut Core,
+        region: &ScanRegion,
+        custom_ap: Option<FullyQualifiedApAddress>,
+    ) -> Result<Rtt, Error> {
         let ptr = Self::find_control_block(core, region)?;
-        Self::attach_at(core, ptr)
+        Self::attach_at(core, ptr, custom_ap)
     }
 
     /// Attempts to detect an RTT control block anywhere in the target RAM and returns an instance
     /// if a valid control block was found.
-    pub fn attach(core: &mut Core) -> Result<Rtt, Error> {
-        Self::attach_region(core, &ScanRegion::default())
+    pub fn attach(
+        core: &mut Core,
+        custom_ap: Option<FullyQualifiedApAddress>,
+    ) -> Result<Rtt, Error> {
+        Self::attach_region(core, &ScanRegion::default(), custom_ap)
     }
 
     /// Attempts to detect an RTT control block in the specified RAM region(s) and returns an
@@ -546,8 +565,12 @@ pub fn try_attach_to_rtt(
     core: &mut Core<'_>,
     timeout: Duration,
     rtt_region: &ScanRegion,
+    custom_ap: Option<FullyQualifiedApAddress>,
 ) -> Result<Rtt, Error> {
-    try_attach_to_rtt_inner(|| Rtt::attach_region(core, rtt_region), timeout)
+    try_attach_to_rtt_inner(
+        || Rtt::attach_region(core, rtt_region, custom_ap.clone()),
+        timeout,
+    )
 }
 
 /// Try to attach to RTT, with the given timeout.
@@ -556,12 +579,13 @@ pub fn try_attach_to_rtt_shared(
     core_id: usize,
     timeout: Duration,
     rtt_region: &ScanRegion,
+    custom_ap: Option<FullyQualifiedApAddress>,
 ) -> Result<Rtt, Error> {
     try_attach_to_rtt_inner(
         || {
             let mut session_handle = session.lock();
             let mut core = session_handle.core(core_id)?;
-            Rtt::attach_region(&mut core, rtt_region)
+            Rtt::attach_region(&mut core, rtt_region, custom_ap.clone())
         },
         timeout,
     )

@@ -1,7 +1,8 @@
 use crate::{
     CoreType, Endian, InstructionSet, MemoryInterface, Target,
     architecture::{
-        arm::sequences::ArmDebugSequence, riscv::sequences::RiscvDebugSequence,
+        arm::{FullyQualifiedApAddress, sequences::ArmDebugSequence},
+        riscv::sequences::RiscvDebugSequence,
         xtensa::sequences::XtensaDebugSequence,
     },
     config::DebugSequence,
@@ -160,6 +161,17 @@ pub trait CoreInterface: MemoryInterface {
     /// Disables vector catching for the given `condition`
     fn disable_vector_catch(&mut self, _condition: VectorCatchCondition) -> Result<(), Error> {
         Err(Error::NotImplemented("vector catch"))
+    }
+
+    /// Returns a memory interface for the given AP address.
+    ///
+    /// In most cases, there is only one relevant AP which will be returned which is the core
+    /// object itself. In other cases, a core might have multiple access ports for different tasks.
+    fn memory_interface(&mut self, _ap: &FullyQualifiedApAddress) -> &mut dyn MemoryInterface
+    where
+        Self: Sized,
+    {
+        self
     }
 
     /// Check if the integer size is 64-bit

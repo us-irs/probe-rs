@@ -161,7 +161,7 @@ fn main() -> Result<()> {
     eprintln!("Attaching to RTT...");
 
     let mut rtt =
-        Rtt::attach_region(&mut core, &opts.scan_region).context("Error attaching to RTT")?;
+        Rtt::attach_region(&mut core, &opts.scan_region, None).context("Error attaching to RTT")?;
     eprintln!("Found control block at {:#010x}", rtt.ptr());
 
     if opts.list {

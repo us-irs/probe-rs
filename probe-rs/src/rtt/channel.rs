@@ -1,6 +1,7 @@
+use crate::architecture::arm::FullyQualifiedApAddress;
 use crate::memory::{Operation, OperationKind};
 use crate::rtt::Error;
-use crate::{Core, MemoryInterface};
+use crate::{Core, CoreInterface as _, MemoryInterface};
 use probe_rs_target::RegionMergeIterator;
 use std::cmp::min;
 use std::ffi::CStr;
@@ -98,17 +99,20 @@ impl RttChannelBuffer {
         }
     }
 
-    /// return (write_buffer_ptr, read_buffer_ptr)
-    pub fn read_buffer_offsets(&self, core: &mut Core, ptr: u64) -> Result<(u64, u64), Error> {
+    pub fn read_buffer_offsets(
+        &self,
+        memory: &mut dyn MemoryInterface,
+        ptr: u64,
+    ) -> Result<(u64, u64), Error> {
         Ok(match self {
             RttChannelBuffer::Buffer32(h32) => {
                 let mut block = [0u32; 2];
-                core.read_32(ptr + h32.write_buffer_ptr_offset() as u64, block.as_mut())?;
+                memory.read_32(ptr + h32.write_buffer_ptr_offset() as u64, block.as_mut())?;
                 (u64::from(block[0]), u64::from(block[1]))
             }
             RttChannelBuffer::Buffer64(h64) => {
                 let mut block = [0u32; 2];
-                core.read_32(ptr + h64.write_buffer_ptr_offset() as u64, block.as_mut())?;
+                memory.read_32(ptr + h64.write_buffer_ptr_offset() as u64, block.as_mut())?;
                 (u64::from(block[0]), u64::from(block[1]))
             }
         })
@@ -116,19 +120,19 @@ impl RttChannelBuffer {
 
     pub fn write_write_buffer_ptr(
         &self,
-        core: &mut Core,
+        memory: &mut dyn MemoryInterface,
         ptr: u64,
         buffer_ptr: u64,
     ) -> Result<(), Error> {
         match self {
             RttChannelBuffer::Buffer32(h32) => {
-                core.write_word_32(
+                memory.write_word_32(
                     ptr + h32.write_buffer_ptr_offset() as u64,
                     buffer_ptr.try_into().unwrap(),
                 )?;
             }
             RttChannelBuffer::Buffer64(h64) => {
-                core.write_word_64(ptr + h64.write_buffer_ptr_offset() as u64, buffer_ptr)?;
+                memory.write_word_64(ptr + h64.write_buffer_ptr_offset() as u64, buffer_ptr)?;
             }
         };
         Ok(())
@@ -147,24 +151,29 @@ impl RttChannelBuffer {
         }
     }
 
-    pub fn read_flags(&self, core: &mut Core, ptr: u64) -> Result<u64, Error> {
+    pub fn read_flags(&self, memory: &mut dyn MemoryInterface, ptr: u64) -> Result<u64, Error> {
         Ok(match self {
             RttChannelBuffer::Buffer32(h32) => {
-                u64::from(core.read_word_32(ptr + h32.flags_offset() as u64)?)
+                u64::from(memory.read_word_32(ptr + h32.flags_offset() as u64)?)
             }
             RttChannelBuffer::Buffer64(h64) => {
-                u64::from(core.read_word_32(ptr + h64.flags_offset() as u64)?)
+                u64::from(memory.read_word_32(ptr + h64.flags_offset() as u64)?)
             }
         })
     }
 
-    pub fn write_flags(&self, core: &mut Core, ptr: u64, flags: u64) -> Result<(), Error> {
+    pub fn write_flags(
+        &self,
+        memory: &mut dyn MemoryInterface,
+        ptr: u64,
+        flags: u64,
+    ) -> Result<(), Error> {
         match self {
             RttChannelBuffer::Buffer32(h32) => {
-                core.write_word_32(ptr + h32.flags_offset() as u64, flags.try_into().unwrap())?;
+                memory.write_word_32(ptr + h32.flags_offset() as u64, flags.try_into().unwrap())?;
             }
             RttChannelBuffer::Buffer64(h64) => {
-                core.write_word_32(ptr + h64.flags_offset() as u64, flags.try_into().unwrap())?;
+                memory.write_word_32(ptr + h64.flags_offset() as u64, flags.try_into().unwrap())?;
             }
         };
         Ok(())
@@ -196,6 +205,7 @@ pub(crate) struct Channel {
 impl Channel {
     pub(crate) fn from(
         core: &mut Core,
+        memory_ap: Option<&FullyQualifiedApAddress>,
         number: usize,
         metadata_ptr: u64,
         info: RttChannelBuffer,
@@ -217,7 +227,7 @@ impl Channel {
         // It's possible that the channel is not initialized with the magic string written last.
         // We call read_pointers to validate that the channel pointers are in an expected range.
         // This should at least catch most cases where the control block is partially initialized.
-        this.read_pointers(core, "")?;
+        this.read_pointers(core, memory_ap, "")?;
         // Read channel name just after the pointer was validated to be within an expected range.
         this.name = if let Some(ptr) = this.info.standard_name_pointer() {
             read_c_string(core, ptr)?
@@ -259,8 +269,17 @@ impl Channel {
         Ok(())
     }
 
-    fn read_pointers(&self, core: &mut Core, channel_kind: &str) -> Result<(u64, u64), Error> {
-        let (write, read) = self.info.read_buffer_offsets(core, self.metadata_ptr)?;
+    fn read_pointers(
+        &self,
+        core: &mut Core,
+        memory_ap: Option<&FullyQualifiedApAddress>,
+        channel_kind: &str,
+    ) -> Result<(u64, u64), Error> {
+        let mem = match memory_ap {
+            Some(ap) => core.memory_interface(ap),
+            None => core,
+        };
+        let (write, read) = self.info.read_buffer_offsets(mem, self.metadata_ptr)?;
 
         // Validate whether the buffers are sensible
         let validate = |which, value| {
@@ -311,37 +330,40 @@ impl Channel {
 
 /// RTT up (target to host) channel.
 #[derive(Debug)]
-pub struct UpChannel(pub(crate) Channel);
+pub struct UpChannel {
+    pub(crate) channel: Channel,
+    pub(crate) custom_ap: Option<FullyQualifiedApAddress>,
+}
 
 impl UpChannel {
     /// Returns the number of the channel.
     pub fn number(&self) -> usize {
-        self.0.number
+        self.channel.number
     }
 
     /// Returns the name of the channel or `None` if there is none.
     pub fn name(&self) -> Option<&str> {
-        self.0.name()
+        self.channel.name()
     }
 
     /// Returns the buffer size in bytes. Note that the usable size is one byte less due to how the
     /// ring buffer is implemented.
     pub fn buffer_size(&self) -> usize {
-        self.0.buffer_size()
+        self.channel.buffer_size()
     }
 
     /// Reads the current channel mode from the target and returns its.
     ///
     /// See [`ChannelMode`] for more information on what the modes mean.
     pub fn mode(&self, core: &mut Core) -> Result<ChannelMode, Error> {
-        self.0.mode(core)
+        self.channel.mode(core)
     }
 
     /// Changes the channel mode on the target to the specified mode.
     ///
     /// See [`ChannelMode`] for more information on what the modes mean.
     pub fn set_mode(&self, core: &mut Core, mode: ChannelMode) -> Result<(), Error> {
-        self.0.set_mode(core, mode)
+        self.channel.set_mode(core, mode)
     }
 
     fn read_core(
@@ -350,11 +372,13 @@ impl UpChannel {
         mut buf: &mut [u8],
         consume: bool,
     ) -> Result<usize, Error> {
-        let (write, mut read) = self.0.read_pointers(core, "up ")?;
+        let (write, mut read) = self
+            .channel
+            .read_pointers(core, self.custom_ap.as_ref(), "up ")?;
 
         let mut total = 0;
 
-        if let Some(ptr) = self.0.last_read_ptr {
+        if let Some(ptr) = self.channel.last_read_ptr {
             // Check if the read pointer has changed since we last wrote it.
             if read != ptr {
                 return Err(Error::ReadPointerChanged);
@@ -370,14 +394,14 @@ impl UpChannel {
                 break;
             }
 
-            let address = self.0.info.buffer_start_pointer() + read;
+            let address = self.channel.info.buffer_start_pointer() + read;
             let (buffer, remaining) = buf.split_at_mut(count);
             operations.push(Operation::new(address, OperationKind::Read(buffer)));
 
             total += count;
             read += count as u64;
 
-            if read >= self.0.info.size_of_buffer() {
+            if read >= self.channel.info.size_of_buffer() {
                 // Wrap around to start
                 read = 0;
             }
@@ -388,9 +412,9 @@ impl UpChannel {
         if consume && total > 0 {
             // Write read pointer back to target if something was read
             operations.push(
-                self.0
+                self.channel
                     .info
-                    .write_read_buffer_ptr_operation(self.0.metadata_ptr, read),
+                    .write_read_buffer_ptr_operation(self.channel.metadata_ptr, read),
             );
         }
 
@@ -404,7 +428,7 @@ impl UpChannel {
 
         if consume {
             // Pointer was successfully written, update stored value
-            self.0.last_read_ptr = Some(read);
+            self.channel.last_read_ptr = Some(read);
         }
 
         Ok(total)
@@ -431,7 +455,7 @@ impl UpChannel {
     /// Calculates amount of contiguous data available for reading
     fn readable_contiguous(&self, write: u64, read: u64) -> usize {
         let end = if read > write {
-            self.0.info.size_of_buffer()
+            self.channel.info.size_of_buffer()
         } else {
             write
         };
@@ -443,37 +467,40 @@ impl UpChannel {
 impl RttChannel for UpChannel {
     /// Returns the number of the channel.
     fn number(&self) -> usize {
-        self.0.number
+        self.channel.number
     }
 
     fn name(&self) -> Option<&str> {
-        self.0.name()
+        self.channel.name()
     }
 
     fn buffer_size(&self) -> usize {
-        self.0.buffer_size()
+        self.channel.buffer_size()
     }
 }
 
 /// RTT down (host to target) channel.
 #[derive(Debug)]
-pub struct DownChannel(pub(crate) Channel);
+pub struct DownChannel {
+    pub(crate) channel: Channel,
+    pub(crate) custom_ap: Option<FullyQualifiedApAddress>,
+}
 
 impl DownChannel {
     /// Returns the number of the channel.
     pub fn number(&self) -> usize {
-        self.0.number
+        self.channel.number
     }
 
     /// Returns the name of the channel or `None` if there is none.
     pub fn name(&self) -> Option<&str> {
-        self.0.name()
+        self.channel.name()
     }
 
     /// Returns the buffer size in bytes. Note that the usable size is one byte less due to how the
     /// ring buffer is implemented.
     pub fn buffer_size(&self) -> usize {
-        self.0.buffer_size()
+        self.channel.buffer_size()
     }
 
     /// Writes some bytes into the channel buffer and returns the number of bytes written.
@@ -481,7 +508,9 @@ impl DownChannel {
     /// This method will not block waiting for space to become available in the channel buffer, and
     /// may not write all of `buf`.
     pub fn write(&mut self, core: &mut Core, mut buf: &[u8]) -> Result<usize, Error> {
-        let (mut write, read) = self.0.read_pointers(core, "down ")?;
+        let (mut write, read) =
+            self.channel
+                .read_pointers(core, self.custom_ap.as_ref(), "down ")?;
 
         let mut total = 0;
 
@@ -492,12 +521,15 @@ impl DownChannel {
                 break;
             }
 
-            core.write(self.0.info.buffer_start_pointer() + write, &buf[..count])?;
+            core.write(
+                self.channel.info.buffer_start_pointer() + write,
+                &buf[..count],
+            )?;
 
             total += count;
             write += count as u64;
 
-            if write >= self.0.info.size_of_buffer() {
+            if write >= self.channel.info.size_of_buffer() {
                 // Wrap around to start
                 write = 0;
             }
@@ -506,9 +538,9 @@ impl DownChannel {
         }
 
         // Write write pointer back to target
-        self.0
+        self.channel
             .info
-            .write_write_buffer_ptr(core, self.0.metadata_ptr, write)?;
+            .write_write_buffer_ptr(core, self.channel.metadata_ptr, write)?;
 
         Ok(total)
     }
@@ -518,9 +550,9 @@ impl DownChannel {
         (if read > write {
             read - write - 1
         } else if read == 0 {
-            self.0.info.size_of_buffer() - write - 1
+            self.channel.info.size_of_buffer() - write - 1
         } else {
-            self.0.info.size_of_buffer() - write
+            self.channel.info.size_of_buffer() - write
         }) as usize
     }
 }
@@ -528,15 +560,15 @@ impl DownChannel {
 impl RttChannel for DownChannel {
     /// Returns the number of the channel.
     fn number(&self) -> usize {
-        self.0.number
+        self.channel.number
     }
 
     fn name(&self) -> Option<&str> {
-        self.0.name()
+        self.channel.name()
     }
 
     fn buffer_size(&self) -> usize {
-        self.0.buffer_size()
+        self.channel.buffer_size()
     }
 }
 
