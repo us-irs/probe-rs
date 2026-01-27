@@ -42,8 +42,6 @@ impl CombinedCoreState {
     ) -> Result<Core<'probe>, Error> {
         let name = &target.cores[self.id].name;
 
-        let memory = arm_interface.memory_interface(&self.arm_memory_ap())?;
-
         let ResolvedCoreOptions::Arm { options, sequence } = &self.core_state.core_access_options
         else {
             unreachable!(
@@ -52,49 +50,63 @@ impl CombinedCoreState {
             );
         };
         let debug_sequence = sequence.clone();
+        let memory_ap = self.arm_memory_ap();
 
         Ok(match &mut self.specific_state {
-            SpecificCoreState::Armv6m(s) => Core::new(
-                self.id,
-                name,
-                target,
-                crate::architecture::arm::armv6m::Armv6m::new(memory, s, debug_sequence)?,
-            ),
+            SpecificCoreState::Armv6m(s) => {
+                let memory = arm_interface.memory_interface(&memory_ap)?;
+                Core::new(
+                    self.id,
+                    name,
+                    target,
+                    crate::architecture::arm::armv6m::Armv6m::new(memory, s, debug_sequence)?,
+                )
+            }
             SpecificCoreState::Armv7a(s) => Core::new(
                 self.id,
                 name,
                 target,
                 crate::architecture::arm::armv7a::Armv7a::new(
-                    memory,
+                    arm_interface,
+                    memory_ap,
                     s,
                     options.debug_base.expect("base_address not specified"),
                     debug_sequence,
                 )?,
             ),
-            SpecificCoreState::Armv7m(s) | SpecificCoreState::Armv7em(s) => Core::new(
-                self.id,
-                name,
-                target,
-                crate::architecture::arm::armv7m::Armv7m::new(memory, s, debug_sequence)?,
-            ),
-            SpecificCoreState::Armv8a(s) => Core::new(
-                self.id,
-                name,
-                target,
-                crate::architecture::arm::armv8a::Armv8a::new(
-                    memory,
-                    s,
-                    options.debug_base.expect("base_address not specified"),
-                    options.cti_base.expect("cti_address not specified"),
-                    debug_sequence,
-                )?,
-            ),
-            SpecificCoreState::Armv8m(s) => Core::new(
-                self.id,
-                name,
-                target,
-                crate::architecture::arm::armv8m::Armv8m::new(memory, s, debug_sequence)?,
-            ),
+            SpecificCoreState::Armv7m(s) | SpecificCoreState::Armv7em(s) => {
+                let memory = arm_interface.memory_interface(&memory_ap)?;
+                Core::new(
+                    self.id,
+                    name,
+                    target,
+                    crate::architecture::arm::armv7m::Armv7m::new(memory, s, debug_sequence)?,
+                )
+            }
+            SpecificCoreState::Armv8a(s) => {
+                let memory = arm_interface.memory_interface(&memory_ap)?;
+                Core::new(
+                    self.id,
+                    name,
+                    target,
+                    crate::architecture::arm::armv8a::Armv8a::new(
+                        memory,
+                        s,
+                        options.debug_base.expect("base_address not specified"),
+                        options.cti_base.expect("cti_address not specified"),
+                        debug_sequence,
+                    )?,
+                )
+            }
+            SpecificCoreState::Armv8m(s) => {
+                let memory = arm_interface.memory_interface(&memory_ap)?;
+                Core::new(
+                    self.id,
+                    name,
+                    target,
+                    crate::architecture::arm::armv8m::Armv8m::new(memory, s, debug_sequence)?,
+                )
+            }
             _ => {
                 unreachable!(
                     "The stored core state is not compatible with the ARM architecture. \
