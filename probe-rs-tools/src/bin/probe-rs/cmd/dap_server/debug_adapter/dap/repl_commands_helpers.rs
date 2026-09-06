@@ -653,6 +653,17 @@ mod test {
         assert_eq!(last_piece, "b");
         assert_eq!(commands[0].command, "break");
         assert_eq!(root, ""); // yaml is not a subcommand so we don't include "b" in the command root.
+
+        let (_root, last_piece, commands) = build_expanded_commands(&REPL_COMMANDS, "step");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(last_piece, "step");
+        assert_eq!(commands[0].command, "step");
+
+        let (root, last_piece, commands) = build_expanded_commands(&REPL_COMMANDS, "step over");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(last_piece, "over");
+        assert_eq!(commands[0].command, "over");
+        assert_eq!(root, "step ");
     }
 
     #[test]
@@ -675,7 +686,7 @@ mod test {
             &[
                 (
                     "break ",
-                    "break [*address | file:line[:column]]: Set a breakpoint at a location, or halt the target if unspecified.",
+                    "break [address | file:line[:column]]: Set a breakpoint at a location, or halt the target if unspecified.",
                 ),
                 (
                     "bt ",
@@ -689,14 +700,14 @@ mod test {
             "br",
             &[(
                 "break ",
-                "break [*address | file:line[:column]]: Set a breakpoint at a location, or halt the target if unspecified.",
+                "break [address | file:line[:column]]: Set a breakpoint at a location, or halt the target if unspecified.",
             )],
         );
         assert_completion_result(
             "break",
             &[(
                 "break ",
-                "break [*address | file:line[:column]]: Set a breakpoint at a location, or halt the target if unspecified.",
+                "break [address | file:line[:column]]: Set a breakpoint at a location, or halt the target if unspecified.",
             )],
         );
         assert_completion_result(
